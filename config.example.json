@@ -1,0 +1,26 @@
+{
+  "state_db": "state.db",
+  "state_flush_secs": 10,
+  "api": {
+    "listen": "127.0.0.1:7070",
+    "token": "changeme"
+  },
+  "total_quota": "100GB",
+  "users": [
+    {
+      "name": "alice",
+      "quota": "30GB",
+      "rules": [
+        { "listen": "0.0.0.0:8080", "target": "10.0.0.2:80", "tag": "web" },
+        { "listen": "0.0.0.0:5353", "target": "10.0.0.2:53", "protocol": "udp" }
+      ]
+    },
+    {
+      "name": "bob",
+      "rules": [
+        { "listen": "0.0.0.0:9000", "target": "192.168.1.5:9000", "protocol": "tcp" },
+        { "listen": "0.0.0.0:9001", "target": "192.168.1.5:9001", "enabled": false }
+      ]
+    }
+  ]
+}
