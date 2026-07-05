@@ -14,16 +14,17 @@ pub enum Direction {
 /// broadcasts to all live connections the moment the quota runs out.
 pub struct UserQuota {
     pub name: String,
-    pub limit: u64,
+    /// `None` means unlimited: usage is still tracked, never enforced.
+    pub limit: Option<u64>,
     upload: AtomicU64,
     download: AtomicU64,
     exhausted: watch::Sender<bool>,
 }
 
 impl UserQuota {
-    pub fn new(name: String, limit: u64, upload: u64, download: u64) -> Self {
+    pub fn new(name: String, limit: Option<u64>, upload: u64, download: u64) -> Self {
         let used = upload.max(download);
-        let (exhausted, _) = watch::channel(used >= limit);
+        let (exhausted, _) = watch::channel(limit.is_some_and(|l| used >= l));
         Self {
             name,
             limit,
@@ -44,7 +45,9 @@ impl UserQuota {
             Direction::Download => &self.download,
         };
         counter.fetch_add(n, Ordering::Relaxed);
-        if self.used() >= self.limit {
+        if let Some(limit) = self.limit
+            && self.used() >= limit
+        {
             self.exhausted.send_replace(true);
             return false;
         }
@@ -73,8 +76,9 @@ impl UserQuota {
         self.upload().max(self.download())
     }
 
-    pub fn remaining(&self) -> u64 {
-        self.limit.saturating_sub(self.used())
+    /// Remaining bytes before the limit; `None` when unlimited.
+    pub fn remaining(&self) -> Option<u64> {
+        self.limit.map(|l| l.saturating_sub(self.used()))
     }
 }
 
@@ -97,24 +101,24 @@ mod tests {
 
     #[test]
     fn usage_is_max_of_directions() {
-        let quota = UserQuota::new("a".into(), 100, 0, 0);
+        let quota = UserQuota::new("a".into(), Some(100), 0, 0);
         assert!(quota.try_consume(60, Direction::Upload));
         // Download up to the upload level doesn't add billed usage.
         assert!(quota.try_consume(60, Direction::Download));
         assert_eq!(quota.used(), 60);
-        assert_eq!(quota.remaining(), 40);
+        assert_eq!(quota.remaining(), Some(40));
     }
 
     #[test]
     fn consume_until_exhausted() {
-        let quota = UserQuota::new("a".into(), 100, 0, 0);
+        let quota = UserQuota::new("a".into(), Some(100), 0, 0);
         assert!(quota.try_consume(60, Direction::Download));
         assert!(!quota.is_exhausted());
         // Download reaches the limit: exhausted, upload level irrelevant.
         assert!(!quota.try_consume(40, Direction::Download));
         assert!(quota.is_exhausted());
         assert_eq!(quota.used(), 100);
-        assert_eq!(quota.remaining(), 0);
+        assert_eq!(quota.remaining(), Some(0));
         // Once exhausted nothing more is counted.
         assert!(!quota.try_consume(1, Direction::Upload));
         assert_eq!(quota.used(), 100);
@@ -122,24 +126,34 @@ mod tests {
 
     #[test]
     fn starts_exhausted_when_restored_over_limit() {
-        let quota = UserQuota::new("a".into(), 100, 120, 30);
+        let quota = UserQuota::new("a".into(), Some(100), 120, 30);
         assert!(quota.is_exhausted());
-        assert_eq!(quota.remaining(), 0);
+        assert_eq!(quota.remaining(), Some(0));
     }
 
     #[test]
     fn raised_limit_reenables() {
         // Simulates a config edit + restart: same usage, bigger limit.
-        let quota = UserQuota::new("a".into(), 200, 80, 30);
+        let quota = UserQuota::new("a".into(), Some(200), 80, 30);
         assert!(!quota.is_exhausted());
         assert!(quota.try_consume(10, Direction::Upload));
         assert_eq!(quota.used(), 90);
-        assert_eq!(quota.remaining(), 110);
+        assert_eq!(quota.remaining(), Some(110));
+    }
+
+    #[test]
+    fn unlimited_tracks_but_never_exhausts() {
+        let quota = UserQuota::new("a".into(), None, u64::MAX / 2, 0);
+        assert!(!quota.is_exhausted());
+        assert!(quota.try_consume(1 << 40, Direction::Download));
+        assert!(!quota.is_exhausted());
+        assert_eq!(quota.used(), u64::MAX / 2);
+        assert_eq!(quota.remaining(), None);
     }
 
     #[tokio::test]
     async fn exhausted_future_resolves() {
-        let quota = UserQuota::new("a".into(), 10, 0, 0);
+        let quota = UserQuota::new("a".into(), Some(10), 0, 0);
         let rx = quota.subscribe();
         let waiter = tokio::spawn(exhausted(rx));
         assert!(!waiter.is_finished());

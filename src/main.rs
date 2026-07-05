@@ -77,7 +77,7 @@ fn main() -> ExitCode {
 
 async fn run(args: Args) -> Result<(), String> {
     let config = config::load(&args.config)?;
-    let quotas = config::resolve_quotas(&config)?;
+    let quotas = config::resolve_quotas(&config);
 
     let db = Arc::new(StateDb::open(&config.state_db)?);
     let saved = db.load()?;
@@ -87,21 +87,25 @@ async fn run(args: Args) -> Result<(), String> {
         let limit = quotas[&user.name];
         let (upload, download) = saved.get(&user.name).copied().unwrap_or((0, 0));
         let quota = Arc::new(UserQuota::new(user.name.clone(), limit, upload, download));
-        if quota.is_exhausted() {
-            warn!(
+        match limit {
+            None => info!(
+                user = %user.name,
+                "quota unlimited ({} used)",
+                format_size(quota.used()),
+            ),
+            Some(limit) if quota.is_exhausted() => warn!(
                 user = %user.name,
                 "quota already exhausted ({} used of {})",
                 format_size(quota.used()),
                 format_size(limit),
-            );
-        } else {
-            info!(
+            ),
+            Some(limit) => info!(
                 user = %user.name,
                 "quota {} ({} used, {} remaining)",
                 format_size(limit),
                 format_size(quota.used()),
-                format_size(quota.remaining()),
-            );
+                format_size(quota.remaining().unwrap_or(0)),
+            ),
         }
         users.push(quota);
     }

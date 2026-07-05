@@ -139,8 +139,8 @@ mod tests {
         let db = StateDb::open(&path).unwrap();
         assert!(db.load().unwrap().is_empty());
 
-        let alice = Arc::new(UserQuota::new("alice".into(), 1000, 0, 0));
-        let bob = Arc::new(UserQuota::new("bob".into(), 1000, 0, 0));
+        let alice = Arc::new(UserQuota::new("alice".into(), Some(1000), 0, 0));
+        let bob = Arc::new(UserQuota::new("bob".into(), Some(1000), 0, 0));
         alice.try_consume(123, Direction::Upload);
         alice.try_consume(456, Direction::Download);
         bob.try_consume(7, Direction::Download);

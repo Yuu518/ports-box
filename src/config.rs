@@ -16,6 +16,11 @@ pub struct Config {
     pub api: Option<ApiConfig>,
     #[serde(default)]
     pub total_quota: Option<ByteSize>,
+    /// Single-user shorthand: top-level rules become a user named
+    /// "default". Mutually exclusive with `users`.
+    #[serde(default)]
+    pub rules: Vec<Rule>,
+    #[serde(default)]
     pub users: Vec<UserConfig>,
 }
 
@@ -176,13 +181,28 @@ pub fn load(path: &Path) -> Result<Config, String> {
         serde_json::from_str(&raw)
             .map_err(|e| format!("invalid config {}: {e}", path.display()))?
     };
+    finalize(config)
+}
+
+/// Folds the single-user shorthand into `users`, then validates.
+fn finalize(mut config: Config) -> Result<Config, String> {
+    if !config.rules.is_empty() {
+        if !config.users.is_empty() {
+            return Err("top-level rules and users cannot both be set".into());
+        }
+        config.users.push(UserConfig {
+            name: "default".into(),
+            quota: None,
+            rules: std::mem::take(&mut config.rules),
+        });
+    }
     validate(&config)?;
     Ok(config)
 }
 
 fn validate(config: &Config) -> Result<(), String> {
     if config.users.is_empty() {
-        return Err("config has no users".into());
+        return Err("config has no users or rules".into());
     }
     if config.state_flush_secs == 0 {
         return Err("state_flush_secs must be at least 1".into());
@@ -221,37 +241,24 @@ fn validate(config: &Config) -> Result<(), String> {
         }
     }
 
-    resolve_quotas(config).map(|_| ())
+    Ok(())
 }
 
 /// Returns the effective quota (bytes) per user: an explicit `quota` wins;
-/// users without one split `total_quota` evenly.
-pub fn resolve_quotas(config: &Config) -> Result<HashMap<String, u64>, String> {
-    let unset: Vec<&UserConfig> = config
+/// users without one split `total_quota` evenly. With neither, the user is
+/// unlimited (`None`): usage is tracked but never enforced.
+pub fn resolve_quotas(config: &Config) -> HashMap<String, Option<u64>> {
+    let unset = config.users.iter().filter(|u| u.quota.is_none()).count() as u64;
+    let share = config
+        .total_quota
+        .filter(|_| unset > 0)
+        .map(|ByteSize(total)| total / unset);
+
+    config
         .users
         .iter()
-        .filter(|u| u.quota.is_none())
-        .collect();
-
-    let share = if unset.is_empty() {
-        0
-    } else {
-        match config.total_quota {
-            Some(ByteSize(total)) => total / unset.len() as u64,
-            None => {
-                let names: Vec<&str> = unset.iter().map(|u| u.name.as_str()).collect();
-                return Err(format!(
-                    "users {names:?} have no quota and no total_quota is set"
-                ));
-            }
-        }
-    };
-
-    Ok(config
-        .users
-        .iter()
-        .map(|u| (u.name.clone(), u.quota.map_or(share, |q| q.0)))
-        .collect())
+        .map(|u| (u.name.clone(), u.quota.map(|q| q.0).or(share)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -261,8 +268,7 @@ mod tests {
     fn parse_config(json: &str) -> Result<Config, String> {
         let config: Config =
             serde_json::from_str(json).map_err(|e| e.to_string())?;
-        validate(&config)?;
-        Ok(config)
+        finalize(config)
     }
 
     #[test]
@@ -301,9 +307,9 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let quotas = resolve_quotas(&config).unwrap();
-        assert_eq!(quotas["a"], 1 << 20);
-        assert_eq!(quotas["b"], 1 << 20);
+        let quotas = resolve_quotas(&config);
+        assert_eq!(quotas["a"], Some(1 << 20));
+        assert_eq!(quotas["b"], Some(1 << 20));
     }
 
     #[test]
@@ -319,19 +325,26 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let quotas = resolve_quotas(&config).unwrap();
-        assert_eq!(quotas["a"], 30u64 << 30);
-        assert_eq!(quotas["b"], 50u64 << 30);
-        assert_eq!(quotas["c"], 50u64 << 30);
+        let quotas = resolve_quotas(&config);
+        assert_eq!(quotas["a"], Some(30u64 << 30));
+        assert_eq!(quotas["b"], Some(50u64 << 30));
+        assert_eq!(quotas["c"], Some(50u64 << 30));
     }
 
     #[test]
-    fn missing_quota_and_total_is_error() {
-        let err = parse_config(
-            r#"{"users": [{"name": "a", "rules": [{"listen": "0.0.0.0:1", "target": "x:1"}]}]}"#,
+    fn missing_quota_and_total_means_unlimited() {
+        let config = parse_config(
+            r#"{
+                "users": [
+                    {"name": "a", "rules": [{"listen": "0.0.0.0:1", "target": "x:1"}]},
+                    {"name": "b", "quota": "1MB", "rules": [{"listen": "0.0.0.0:2", "target": "x:1"}]}
+                ]
+            }"#,
         )
-        .unwrap_err();
-        assert!(err.contains("no quota"), "{err}");
+        .unwrap();
+        let quotas = resolve_quotas(&config);
+        assert_eq!(quotas["a"], None);
+        assert_eq!(quotas["b"], Some(1 << 20));
     }
 
     #[test]
@@ -423,6 +436,44 @@ mod tests {
     }
 
     #[test]
+    fn top_level_rules_make_default_user() {
+        let config = parse_config(
+            r#"{"rules": [{"listen": "0.0.0.0:1", "target": "x:1"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(config.users.len(), 1);
+        assert_eq!(config.users[0].name, "default");
+        assert_eq!(config.users[0].rules.len(), 1);
+        // Without quota/total_quota the implicit user is unlimited.
+        assert_eq!(resolve_quotas(&config)["default"], None);
+
+        // total_quota becomes the implicit user's quota.
+        let config = parse_config(
+            r#"{"total_quota": "1MB", "rules": [{"listen": "0.0.0.0:1", "target": "x:1"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(resolve_quotas(&config)["default"], Some(1 << 20));
+    }
+
+    #[test]
+    fn top_level_rules_and_users_conflict() {
+        let err = parse_config(
+            r#"{
+                "rules": [{"listen": "0.0.0.0:1", "target": "x:1"}],
+                "users": [{"name": "a", "rules": [{"listen": "0.0.0.0:2", "target": "x:1"}]}]
+            }"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("cannot both be set"), "{err}");
+    }
+
+    #[test]
+    fn empty_config_is_error() {
+        let err = parse_config(r#"{}"#).unwrap_err();
+        assert!(err.contains("no users or rules"), "{err}");
+    }
+
+    #[test]
     fn yaml_config_parses() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.yaml");
@@ -451,9 +502,9 @@ users:
         )
         .unwrap();
         let config = load(&path).unwrap();
-        let quotas = resolve_quotas(&config).unwrap();
-        assert_eq!(quotas["a"], 1 << 20);
-        assert_eq!(quotas["b"], 1 << 20);
+        let quotas = resolve_quotas(&config);
+        assert_eq!(quotas["a"], Some(1 << 20));
+        assert_eq!(quotas["b"], Some(1 << 20));
         assert_eq!(config.users[0].rules[0].tag.as_deref(), Some("web"));
         assert_eq!(config.users[1].rules[0].protocol, Protocol::Udp);
         assert!(!config.users[1].rules[0].enabled);

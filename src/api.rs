@@ -31,9 +31,9 @@ impl From<&UserQuota> for UserUsage {
     fn from(q: &UserQuota) -> Self {
         Self {
             name: q.name.clone(),
-            total: format_size(q.limit),
+            total: q.limit.map_or_else(|| "unlimited".into(), format_size),
             used: format_size(q.used()),
-            remaining: format_size(q.remaining()),
+            remaining: q.remaining().map_or_else(|| "unlimited".into(), format_size),
         }
     }
 }
@@ -114,12 +114,11 @@ async fn sub_store(
     let Some(user) = state.users.get(&name) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let userinfo = format!(
-        "upload={}; download={}; total={}",
-        user.upload(),
-        user.download(),
-        user.limit
-    );
+    // Unlimited users omit `total=`, which Sub-Store reads as no cap.
+    let mut userinfo = format!("upload={}; download={}", user.upload(), user.download());
+    if let Some(limit) = user.limit {
+        userinfo.push_str(&format!("; total={limit}"));
+    }
     (
         [
             ("subscription-userinfo", userinfo),
@@ -139,10 +138,12 @@ mod tests {
     use tower::ServiceExt as _;
 
     fn test_router(token: Option<String>) -> Router {
-        let alice = Arc::new(UserQuota::new("alice".into(), 1000, 0, 0));
+        let alice = Arc::new(UserQuota::new("alice".into(), Some(1000), 0, 0));
         alice.try_consume(100, Direction::Upload);
         alice.try_consume(200, Direction::Download);
-        router(Arc::new(vec![alice]), token)
+        let bob = Arc::new(UserQuota::new("bob".into(), None, 0, 0));
+        bob.try_consume(50, Direction::Upload);
+        router(Arc::new(vec![alice, bob]), token)
     }
 
     async fn body_json(response: Response) -> serde_json::Value {
@@ -166,7 +167,8 @@ mod tests {
         assert_eq!(
             json,
             serde_json::json!([
-                {"name": "alice", "total": "1000B", "used": "200B", "remaining": "800B"}
+                {"name": "alice", "total": "1000B", "used": "200B", "remaining": "800B"},
+                {"name": "bob", "total": "unlimited", "used": "50B", "remaining": "unlimited"}
             ])
         );
 
@@ -188,6 +190,17 @@ mod tests {
         assert_eq!(
             response.headers()["subscription-userinfo"],
             "upload=100; download=200; total=1000"
+        );
+
+        // Unlimited users omit total entirely.
+        let app = test_router(None);
+        let response = app
+            .oneshot(Request::get("/sub/bob").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            response.headers()["subscription-userinfo"],
+            "upload=50; download=0"
         );
     }
 
