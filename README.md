@@ -17,12 +17,14 @@ cargo build --release
 
 | 参数 | 说明 |
 |---|---|
-| `-c, --config <FILE>` | 配置文件路径，默认 `./config.json` |
+| `-c, --config <FILE>` | 配置文件路径，默认 `./config.json`；扩展名为 `.yaml`/`.yml` 时按 YAML 解析，其余按 JSON |
 | `-d, --dir <DIR>` | 运行目录，启动时先切换到该目录（配置中的相对路径如 `state_db` 以此为基准） |
 
 日志级别通过 `RUST_LOG` 控制（默认 `ports_box=info`）。收到 SIGTERM / SIGINT 时会先把用量写入数据库再退出。
 
 ## 配置文件
+
+支持 JSON 和 YAML 两种格式，按扩展名区分（`.yaml`/`.yml` 为 YAML，其余为 JSON），字段完全相同。
 
 ```json
 {
@@ -51,6 +53,35 @@ cargo build --release
     }
   ]
 }
+```
+
+等价的 YAML 写法（`config.yaml`）：
+
+```yaml
+state_db: state.db
+state_flush_secs: 10
+api:
+  listen: 127.0.0.1:7070
+  token: changeme
+total_quota: 100GB
+users:
+  - name: alice
+    quota: 30GB
+    rules:
+      - listen: 0.0.0.0:8080
+        target: 10.0.0.2:80
+        tag: web
+      - listen: 0.0.0.0:5353
+        target: 10.0.0.2:53
+        protocol: udp
+  - name: bob
+    rules:
+      - listen: 0.0.0.0:9000
+        target: 192.168.1.5:9000
+        protocol: tcp
+      - listen: 0.0.0.0:9001
+        target: 192.168.1.5:9001
+        enabled: false
 ```
 
 | 字段 | 说明 |

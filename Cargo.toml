@@ -9,6 +9,7 @@ license = "MIT"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "signal", "sync", "macros"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml_ng = "0.10"
 clap = { version = "4", features = ["derive"] }
 axum = "0.8"
 rusqlite = { version = "0.37", features = ["bundled"] }

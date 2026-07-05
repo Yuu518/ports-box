@@ -168,8 +168,14 @@ pub fn format_size(bytes: u64) -> String {
 pub fn load(path: &Path) -> Result<Config, String> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read config {}: {e}", path.display()))?;
-    let config: Config = serde_json::from_str(&raw)
-        .map_err(|e| format!("invalid config {}: {e}", path.display()))?;
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let config: Config = if ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml") {
+        serde_yaml_ng::from_str(&raw)
+            .map_err(|e| format!("invalid config {}: {e}", path.display()))?
+    } else {
+        serde_json::from_str(&raw)
+            .map_err(|e| format!("invalid config {}: {e}", path.display()))?
+    };
     validate(&config)?;
     Ok(config)
 }
@@ -414,6 +420,66 @@ mod tests {
             }"#,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn yaml_config_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            r#"
+total_quota: 100GB
+api:
+  listen: 127.0.0.1:7070
+  token: changeme
+users:
+  - name: a
+    quota: 1048576
+    rules:
+      - listen: 0.0.0.0:1
+        target: x:1
+        tag: web
+  - name: b
+    quota: 1MB
+    rules:
+      - listen: 0.0.0.0:2
+        target: x:1
+        protocol: udp
+        enabled: false
+"#,
+        )
+        .unwrap();
+        let config = load(&path).unwrap();
+        let quotas = resolve_quotas(&config).unwrap();
+        assert_eq!(quotas["a"], 1 << 20);
+        assert_eq!(quotas["b"], 1 << 20);
+        assert_eq!(config.users[0].rules[0].tag.as_deref(), Some("web"));
+        assert_eq!(config.users[1].rules[0].protocol, Protocol::Udp);
+        assert!(!config.users[1].rules[0].enabled);
+    }
+
+    #[test]
+    fn load_dispatches_on_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = r#"{"total_quota": 1, "users": [{"name": "a", "rules": [{"listen": "0.0.0.0:1", "target": "x:1"}]}]}"#;
+
+        // JSON content under a .json name parses; the same content under a
+        // .yml name also parses (YAML is a superset of JSON).
+        for name in ["config.json", "config.yml"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, json).unwrap();
+            load(&path).unwrap();
+        }
+
+        // YAML-only syntax is rejected when the file is not .yaml/.yml.
+        let yaml = "total_quota: 1\nusers:\n  - name: a\n    rules:\n      - listen: 0.0.0.0:1\n        target: x:1\n";
+        let bad = dir.path().join("config.conf");
+        std::fs::write(&bad, yaml).unwrap();
+        assert!(load(&bad).unwrap_err().contains("invalid config"));
+        let good = dir.path().join("config.yaml");
+        std::fs::write(&good, yaml).unwrap();
+        load(&good).unwrap();
     }
 
     #[test]

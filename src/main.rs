@@ -22,7 +22,7 @@ use crate::state::StateDb;
 #[derive(Parser)]
 #[command(version, about = "Port forwarder with per-user traffic quotas")]
 struct Args {
-    /// Config file path
+    /// Config file path (.json, or YAML with a .yaml/.yml extension)
     #[arg(short, long, default_value = "config.json")]
     config: PathBuf,
 
