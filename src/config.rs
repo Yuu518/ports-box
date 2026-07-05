@@ -122,6 +122,15 @@ impl Protocol {
     }
 }
 
+/// Accepts an IP literal with port, or a `host:port` shape whose hostname is
+/// resolved at connect time (see `dns::resolve`).
+fn check_target(target: &str) -> Result<(), String> {
+    if target.parse::<SocketAddr>().is_ok() {
+        return Ok(());
+    }
+    crate::dns::split_target(target).map(|_| ())
+}
+
 fn default_state_db() -> PathBuf {
     PathBuf::from("state.db")
 }
@@ -277,6 +286,9 @@ fn validate(config: &Config) -> Result<(), String> {
                     "user {:?}: rule fallback target cannot be empty",
                     user.name
                 ));
+            }
+            for target in std::iter::once(&rule.target).chain(&rule.fallback) {
+                check_target(target).map_err(|e| format!("user {:?}: {e}", user.name))?;
             }
             if rule.check_secs == 0 {
                 return Err(format!(
@@ -507,6 +519,25 @@ mod tests {
         assert_eq!(rules[1].fallback, vec!["y:1", "z:1"]);
         assert!(rules[2].fallback.is_empty());
         assert_eq!(rules[0].check_secs, 10);
+    }
+
+    #[test]
+    fn malformed_target_is_error() {
+        for (target, want) in [
+            ("example.com", "missing a port"),
+            ("example.com:99999", "invalid port"),
+        ] {
+            let err = parse_config(&format!(
+                r#"{{"rules": [{{"listen": "0.0.0.0:1", "target": "{target}"}}]}}"#,
+            ))
+            .unwrap_err();
+            assert!(err.contains(want), "{err}");
+        }
+        // Domains and IP literals both pass.
+        parse_config(
+            r#"{"rules": [{"listen": "0.0.0.0:1", "target": "example.com:80", "fallback": "[::1]:80"}]}"#,
+        )
+        .unwrap();
     }
 
     #[test]

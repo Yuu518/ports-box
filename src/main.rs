@@ -1,5 +1,6 @@
 mod api;
 mod config;
+mod dns;
 mod pool;
 mod quota;
 mod state;

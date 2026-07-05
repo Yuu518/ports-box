@@ -13,6 +13,7 @@ serde_yaml_ng = "0.10"
 clap = { version = "4", features = ["derive"] }
 axum = "0.8"
 rusqlite = { version = "0.37", features = ["bundled"] }
+hickory-resolver = "0.25"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "chrono"] }
 

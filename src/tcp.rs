@@ -40,7 +40,11 @@ async fn connect_active(pool: &Arc<TargetPool>) -> io::Result<TcpStream> {
     let mut last_err = None;
     for _ in 0..pool.len() {
         let (i, target) = pool.pick();
-        match timeout(CONNECT_TIMEOUT, TcpStream::connect(&*target)).await {
+        // The timeout covers DNS resolution plus the connect itself.
+        let connect = async {
+            TcpStream::connect(crate::dns::resolve(&target).await?).await
+        };
+        match timeout(CONNECT_TIMEOUT, connect).await {
             Ok(Ok(stream)) => return Ok(stream),
             Ok(Err(e)) => {
                 last_err = Some(io::Error::new(

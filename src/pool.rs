@@ -117,7 +117,10 @@ pub async fn probe_task(pool: Arc<TargetPool>, interval: Duration) {
     loop {
         for i in 0..pool.len() {
             let target = pool.targets[i].clone();
-            match timeout(CONNECT_TIMEOUT, TcpStream::connect(&*target)).await {
+            let connect = async {
+                TcpStream::connect(crate::dns::resolve(&target).await?).await
+            };
+            match timeout(CONNECT_TIMEOUT, connect).await {
                 Ok(Ok(_)) => pool.mark_up(i),
                 _ => pool.mark_down(i),
             }

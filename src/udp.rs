@@ -129,10 +129,7 @@ async fn open_session(
 }
 
 async fn connect_upstream(target: &str) -> io::Result<UdpSocket> {
-    let target_addr = tokio::net::lookup_host(target)
-        .await?
-        .next()
-        .ok_or_else(|| io::Error::other(format!("cannot resolve {target}")))?;
+    let target_addr = crate::dns::resolve(target).await?;
     let local: SocketAddr = if target_addr.is_ipv6() {
         "[::]:0".parse().unwrap()
     } else {
