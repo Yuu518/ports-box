@@ -46,12 +46,51 @@ pub struct UserConfig {
 pub struct Rule {
     pub listen: SocketAddr,
     pub target: String,
+    /// Backup targets tried in priority order when the target above is
+    /// unreachable. Accepts a single string or a list of strings.
+    #[serde(default, deserialize_with = "string_or_strings")]
+    pub fallback: Vec<String>,
+    /// Health check interval (seconds) for rules with fallbacks; also the
+    /// retry cooldown for UDP-only rules, which cannot be probed.
+    #[serde(default = "default_check_secs")]
+    pub check_secs: u64,
     #[serde(default)]
     pub protocol: Protocol,
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default)]
     pub tag: Option<String>,
+}
+
+fn string_or_strings<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error> {
+    struct Visitor;
+
+    impl<'de> serde::de::Visitor<'de> for Visitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a target string or a list of target strings")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Vec<String>, E> {
+            Ok(vec![v.to_owned()])
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Vec<String>, A::Error> {
+            let mut targets = Vec::new();
+            while let Some(target) = seq.next_element()? {
+                targets.push(target);
+            }
+            Ok(targets)
+        }
+    }
+
+    deserializer.deserialize_any(Visitor)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -93,6 +132,10 @@ fn default_flush_secs() -> u64 {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_check_secs() -> u64 {
+    10
 }
 
 /// A byte count that deserializes from either a plain integer (bytes) or a
@@ -228,6 +271,18 @@ fn validate(config: &Config) -> Result<(), String> {
             }
             if rule.target.is_empty() {
                 return Err(format!("user {:?}: rule target cannot be empty", user.name));
+            }
+            if rule.fallback.iter().any(String::is_empty) {
+                return Err(format!(
+                    "user {:?}: rule fallback target cannot be empty",
+                    user.name
+                ));
+            }
+            if rule.check_secs == 0 {
+                return Err(format!(
+                    "user {:?}: rule check_secs must be at least 1",
+                    user.name
+                ));
             }
             if rule.tag.as_deref() == Some("") {
                 return Err(format!("user {:?}: rule tag cannot be empty", user.name));
@@ -436,6 +491,43 @@ mod tests {
     }
 
     #[test]
+    fn fallback_accepts_string_or_list() {
+        let config = parse_config(
+            r#"{
+                "rules": [
+                    {"listen": "0.0.0.0:1", "target": "x:1", "fallback": "y:1"},
+                    {"listen": "0.0.0.0:2", "target": "x:1", "fallback": ["y:1", "z:1"]},
+                    {"listen": "0.0.0.0:3", "target": "x:1"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let rules = &config.users[0].rules;
+        assert_eq!(rules[0].fallback, vec!["y:1"]);
+        assert_eq!(rules[1].fallback, vec!["y:1", "z:1"]);
+        assert!(rules[2].fallback.is_empty());
+        assert_eq!(rules[0].check_secs, 10);
+    }
+
+    #[test]
+    fn empty_fallback_entry_is_error() {
+        let err = parse_config(
+            r#"{"rules": [{"listen": "0.0.0.0:1", "target": "x:1", "fallback": ["y:1", ""]}]}"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("fallback target cannot be empty"), "{err}");
+    }
+
+    #[test]
+    fn zero_check_secs_is_error() {
+        let err = parse_config(
+            r#"{"rules": [{"listen": "0.0.0.0:1", "target": "x:1", "check_secs": 0}]}"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("check_secs"), "{err}");
+    }
+
+    #[test]
     fn top_level_rules_make_default_user() {
         let config = parse_config(
             r#"{"rules": [{"listen": "0.0.0.0:1", "target": "x:1"}]}"#,
@@ -490,6 +582,9 @@ users:
     rules:
       - listen: 0.0.0.0:1
         target: x:1
+        fallback:
+          - y:1
+          - z:1
         tag: web
   - name: b
     quota: 1MB
@@ -506,6 +601,7 @@ users:
         assert_eq!(quotas["a"], Some(1 << 20));
         assert_eq!(quotas["b"], Some(1 << 20));
         assert_eq!(config.users[0].rules[0].tag.as_deref(), Some("web"));
+        assert_eq!(config.users[0].rules[0].fallback, vec!["y:1", "z:1"]);
         assert_eq!(config.users[1].rules[0].protocol, Protocol::Udp);
         assert!(!config.users[1].rules[0].enabled);
     }

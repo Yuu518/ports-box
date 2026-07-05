@@ -1,5 +1,6 @@
 mod api;
 mod config;
+mod pool;
 mod quota;
 mod state;
 mod tcp;
@@ -16,6 +17,7 @@ use tokio::sync::watch;
 use tracing::{error, info, warn};
 
 use crate::config::format_size;
+use crate::pool::TargetPool;
 use crate::quota::UserQuota;
 use crate::state::StateDb;
 
@@ -119,20 +121,38 @@ async fn run(args: Args) -> Result<(), String> {
                 info!(user = %user.name, listen = %rule.listen, "rule disabled, skipping");
                 continue;
             }
-            let target: Arc<str> = rule.target.as_str().into();
+            let mut targets = vec![rule.target.clone()];
+            targets.extend(rule.fallback.iter().cloned());
+            let check_interval = Duration::from_secs(rule.check_secs);
+            // UDP-only targets cannot be probed over TCP; they recover via
+            // a retry cooldown instead of the probe task.
+            let cooldown = (!rule.fallback.is_empty() && !rule.protocol.tcp())
+                .then_some(check_interval);
+            let pool = TargetPool::new(user.name.clone(), targets, cooldown);
+            if !rule.fallback.is_empty() && rule.protocol.tcp() {
+                tokio::spawn(pool::probe_task(pool.clone(), check_interval));
+            }
             if rule.protocol.tcp() {
                 let listener = TcpListener::bind(rule.listen)
                     .await
                     .map_err(|e| format!("cannot bind tcp {}: {e}", rule.listen))?;
-                tokio::spawn(tcp::serve(listener, target.clone(), quota.clone()));
+                tokio::spawn(tcp::serve(listener, pool.clone(), quota.clone()));
             }
             if rule.protocol.udp() {
                 let socket = UdpSocket::bind(rule.listen)
                     .await
                     .map_err(|e| format!("cannot bind udp {}: {e}", rule.listen))?;
-                tokio::spawn(udp::serve(socket, target.clone(), quota.clone()));
+                tokio::spawn(udp::serve(socket, pool.clone(), quota.clone()));
             }
-            info!(user = %user.name, "{} {} -> {}", rule.protocol, rule.listen, rule.target);
+            if rule.fallback.is_empty() {
+                info!(user = %user.name, "{} {} -> {}", rule.protocol, rule.listen, rule.target);
+            } else {
+                info!(
+                    user = %user.name,
+                    "{} {} -> {} (fallback: {})",
+                    rule.protocol, rule.listen, rule.target, rule.fallback.join(", "),
+                );
+            }
         }
     }
 

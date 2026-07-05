@@ -3,13 +3,15 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
+use crate::pool::{TargetPool, CONNECT_TIMEOUT};
 use crate::quota::{exhausted, Direction, UserQuota};
 
 const COPY_BUF: usize = 64 * 1024;
 
-pub async fn serve(listener: TcpListener, target: Arc<str>, quota: Arc<UserQuota>) {
+pub async fn serve(listener: TcpListener, pool: Arc<TargetPool>, quota: Arc<UserQuota>) {
     loop {
         let (client, peer) = match listener.accept().await {
             Ok(conn) => conn,
@@ -22,20 +24,47 @@ pub async fn serve(listener: TcpListener, target: Arc<str>, quota: Arc<UserQuota
             debug!(user = %quota.name, %peer, "quota exhausted, rejecting tcp connection");
             continue; // dropping the stream closes it
         }
-        let target = target.clone();
+        let pool = pool.clone();
         let quota = quota.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(client, &target, &quota).await {
+            if let Err(e) = handle(client, &pool, &quota).await {
                 debug!(user = %quota.name, %peer, "tcp connection closed: {e}");
             }
         });
     }
 }
 
-async fn handle(client: TcpStream, target: &str, quota: &UserQuota) -> io::Result<()> {
-    let upstream = TcpStream::connect(target).await.map_err(|e| {
-        io::Error::new(e.kind(), format!("connect to {target} failed: {e}"))
-    })?;
+/// Connects to the pool's active target, falling through the priority list
+/// on failure. Gives up once the active index stops moving (all down).
+async fn connect_active(pool: &Arc<TargetPool>) -> io::Result<TcpStream> {
+    let mut last_err = None;
+    for _ in 0..pool.len() {
+        let (i, target) = pool.pick();
+        match timeout(CONNECT_TIMEOUT, TcpStream::connect(&*target)).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(e)) => {
+                last_err = Some(io::Error::new(
+                    e.kind(),
+                    format!("connect to {target} failed: {e}"),
+                ));
+            }
+            Err(_) => {
+                last_err = Some(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("connect to {target} timed out"),
+                ));
+            }
+        }
+        pool.mark_down(i);
+        if pool.pick().0 == i {
+            break; // everything is down; no point cycling
+        }
+    }
+    Err(last_err.unwrap_or_else(|| io::Error::other("no targets")))
+}
+
+async fn handle(client: TcpStream, pool: &Arc<TargetPool>, quota: &UserQuota) -> io::Result<()> {
+    let upstream = connect_active(pool).await?;
     let _ = client.set_nodelay(true);
     let _ = upstream.set_nodelay(true);
 

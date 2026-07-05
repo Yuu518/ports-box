@@ -11,7 +11,7 @@
       "name": "alice",
       "quota": "30GB",
       "rules": [
-        { "listen": "0.0.0.0:8080", "target": "10.0.0.2:80", "tag": "web" },
+        { "listen": "0.0.0.0:8080", "target": "10.0.0.2:80", "fallback": "10.0.0.3:80", "tag": "web" },
         { "listen": "0.0.0.0:5353", "target": "10.0.0.2:53", "protocol": "udp" }
       ]
     },
