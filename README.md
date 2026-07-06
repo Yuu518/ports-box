@@ -24,6 +24,82 @@ cargo build --release
 
 日志级别通过 `RUST_LOG` 控制（默认 `ports_box=info`）。收到 SIGTERM / SIGINT 时会先把用量写入数据库再退出。
 
+## Docker 镜像
+
+镜像由 GitHub Actions 构建并推送到 Docker Hub。仓库需要配置以下 Secrets：
+
+| Secret | 说明 |
+|---|---|
+| `DOCKERHUB_USERNAME` | Docker Hub 用户名 |
+| `DOCKERHUB_TOKEN` | Docker Hub access token |
+
+推送到 `main` / `master`，或手动运行 `Docker` workflow 后，会构建并推送两个 tag：
+
+```text
+<DOCKERHUB_USERNAME>/ports-box:<Cargo.toml 中的版本号>
+<DOCKERHUB_USERNAME>/ports-box:latest
+```
+
+当前版本号来自 `Cargo.toml` 的 `package.version`。
+
+## Docker Compose
+
+先准备配置文件和数据目录：
+
+```sh
+cp config.example.json config.json
+mkdir -p data
+```
+
+创建 `compose.yaml`：
+
+```yaml
+services:
+  ports-box:
+    image: yuu518/ports-box:latest
+    container_name: ports-box
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      RUST_LOG: ports_box=info
+    volumes:
+      - ./config.json:/etc/ports-box/config.json:ro
+      - ./data:/var/lib/ports-box
+    command: ["-c", "/etc/ports-box/config.json", "-d", "/var/lib/ports-box"]
+```
+
+启动、查看日志和停止：
+
+```sh
+docker compose up -d
+docker compose logs -f
+docker compose down
+```
+
+升级镜像后重启：
+
+```sh
+docker compose pull
+docker compose up -d
+```
+
+`network_mode: host` 适合 Linux 服务器部署：配置里的 `listen` 端口会直接监听在宿主机上，不需要为每条 TCP/UDP 规则单独写 `ports` 映射。
+如果不用 host 网络，需要把每个转发端口和 API 端口都显式映射出来，例如：
+
+```yaml
+ports:
+  - "8080:8080/tcp"
+  - "5353:5353/udp"
+  - "7070:7070/tcp"
+```
+
+如果要从源码本地构建镜像，把 `image` 改成：
+
+```yaml
+build: .
+image: ports-box:local
+```
+
 ## 配置文件
 
 支持 JSON 和 YAML 两种格式，按扩展名区分（`.yaml`/`.yml` 为 YAML，其余为 JSON），字段完全相同。
