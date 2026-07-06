@@ -45,7 +45,10 @@ async fn connect_active(pool: &Arc<TargetPool>) -> io::Result<TcpStream> {
             TcpStream::connect(crate::dns::resolve(&target).await?).await
         };
         match timeout(CONNECT_TIMEOUT, connect).await {
-            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Ok(stream)) => {
+                pool.confirm(i);
+                return Ok(stream);
+            }
             Ok(Err(e)) => {
                 last_err = Some(io::Error::new(
                     e.kind(),
@@ -112,5 +115,37 @@ where
             return Err(io::Error::other("quota exhausted"));
         }
         writer.write_all(&buf[..n]).await?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn connect_success_recovers_pinned_primary() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary = listener.local_addr().unwrap().to_string();
+        let accept = tokio::spawn(async move {
+            let _ = listener.accept().await.unwrap();
+        });
+        let pool = TargetPool::new(
+            "a".into(),
+            vec![primary, "127.0.0.1:1".into()],
+            None,
+        );
+        // All targets down pins the active index to the primary; a real
+        // connection succeeding must mark it healthy again.
+        pool.mark_down(0);
+        pool.mark_down(1);
+        assert_eq!(pool.pick().0, 0);
+        assert!(!pool.is_healthy(0));
+
+        let stream = connect_active(&pool).await.unwrap();
+
+        assert_eq!(pool.pick().0, 0);
+        assert!(pool.is_healthy(0));
+        drop(stream);
+        accept.await.unwrap();
     }
 }

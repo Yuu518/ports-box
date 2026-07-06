@@ -116,6 +116,7 @@ async fn run(args: Args) -> Result<(), String> {
 
     // Bind everything up front so a bad config fails fast, before any
     // forwarding starts.
+    let mut probes: Vec<(Arc<TargetPool>, Duration)> = Vec::new();
     for (user, quota) in config.users.iter().zip(users.iter()) {
         for rule in &user.rules {
             if !rule.enabled {
@@ -131,7 +132,7 @@ async fn run(args: Args) -> Result<(), String> {
                 .then_some(check_interval);
             let pool = TargetPool::new(user.name.clone(), targets, cooldown);
             if !rule.fallback.is_empty() && rule.protocol.tcp() {
-                tokio::spawn(pool::probe_task(pool.clone(), check_interval));
+                probes.push((pool.clone(), check_interval));
             }
             if rule.protocol.tcp() {
                 let listener = TcpListener::bind(rule.listen)
@@ -155,6 +156,11 @@ async fn run(args: Args) -> Result<(), String> {
                 );
             }
         }
+    }
+    if !probes.is_empty() {
+        // One shared prober for every rule: probes run serially so a large
+        // rule count never bursts simultaneous connects.
+        tokio::spawn(pool::probe_task(probes));
     }
 
     if let Some(api) = &config.api {

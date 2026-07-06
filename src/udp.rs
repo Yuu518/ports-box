@@ -178,6 +178,9 @@ async fn relay_downstream(
                 break;
             }
             Ok(Ok(n)) => {
+                // A reply from upstream is proof the target is alive: the
+                // strongest health signal UDP can produce.
+                pool.confirm(session.target_index);
                 if !quota.try_consume(n as u64, Direction::Download) {
                     break;
                 }
