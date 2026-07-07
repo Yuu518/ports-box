@@ -82,8 +82,20 @@ async fn run(args: Args) -> Result<(), String> {
     let config = config::load(&args.config)?;
     let quotas = config::resolve_quotas(&config);
 
-    let db = Arc::new(StateDb::open(&config.state_db)?);
-    let saved = db.load()?;
+    let db = match &config.state_file {
+        Some(state) if state.enabled => Some((
+            Arc::new(StateDb::open(&state.path)?),
+            Duration::from_secs(state.flush_secs),
+        )),
+        _ => None,
+    };
+    let saved = match &db {
+        Some((db, _)) => db.load()?,
+        None => {
+            info!("state persistence disabled; usage resets on restart");
+            Default::default()
+        }
+    };
 
     let mut users: Vec<Arc<UserQuota>> = Vec::new();
     for user in &config.users {
@@ -176,11 +188,17 @@ async fn run(args: Args) -> Result<(), String> {
         });
     }
 
+    let Some((db, flush_interval)) = db else {
+        wait_for_shutdown().await;
+        info!("shutting down");
+        return Ok(());
+    };
+
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let flusher = tokio::spawn(state::run_flush_task(
         db,
         users,
-        Duration::from_secs(config.state_flush_secs),
+        flush_interval,
         shutdown_rx,
     ));
 

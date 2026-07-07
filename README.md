@@ -7,7 +7,7 @@
 - **域名解析**：转发目标支持域名，使用本机 DNS 配置（`/etc/resolv.conf`、`/etc/hosts`）解析，结果按记录 TTL 缓存——域名指向变更后新连接自动用新地址，无需重启
 - **流量配额（可选）**：可为用户单独设置配额，也可设一个 `total_quota` 由未单独设置的用户静态平分；两者都不设则该用户**不限量**（只记录用量，不做限制）；用量按**入出取大**计费（`max(上行, 下行)`）
 - **配额耗尽即停**：新连接被拒绝、传输中的连接立即断开、UDP 包丢弃；调大配额并重启后恢复
-- **用量持久化**：已用流量保存在 SQLite 数据库中（默认每 10 秒写入、退出时写入），重启不清零
+- **用量持久化（可选）**：配置 `state_file` 后已用流量保存在 SQLite 数据库中（默认每 10 秒写入、退出时写入），重启不清零；不配置则只在内存中计数，重启归零
 - **查询 API**：HTTP 接口返回每个用户的总量/已用/剩余；兼容 Sub-Store（`subscription-userinfo` 响应头）
 
 ## 构建与运行
@@ -20,7 +20,7 @@ cargo build --release
 | 参数 | 说明 |
 |---|---|
 | `-c, --config <FILE>` | 配置文件路径，默认 `./config.json`；扩展名为 `.yaml`/`.yml` 时按 YAML 解析，其余按 JSON |
-| `-d, --dir <DIR>` | 运行目录，启动时先切换到该目录（配置中的相对路径如 `state_db` 以此为基准） |
+| `-d, --dir <DIR>` | 运行目录，启动时先切换到该目录（配置中的相对路径如 `state_file.path` 以此为基准） |
 
 日志级别通过 `RUST_LOG` 控制（默认 `ports_box=info`）。收到 SIGTERM / SIGINT 时会先把用量写入数据库再退出。
 
@@ -119,8 +119,11 @@ image: ports-box:local
 
 ```json
 {
-  "state_db": "state.db",
-  "state_flush_secs": 10,
+  "state_file": {
+    "enabled": true,
+    "path": "state.db",
+    "flush_secs": 10
+  },
   "api": {
     "listen": "127.0.0.1:7070",
     "token": "changeme"
@@ -149,8 +152,10 @@ image: ports-box:local
 等价的 YAML 写法（`config.yaml`）：
 
 ```yaml
-state_db: state.db
-state_flush_secs: 10
+state_file:
+  enabled: true
+  path: state.db
+  flush_secs: 10
 api:
   listen: 127.0.0.1:7070
   token: changeme
@@ -178,8 +183,7 @@ users:
 
 | 字段 | 说明 |
 |---|---|
-| `state_db` | SQLite 用量数据库路径，默认 `state.db` |
-| `state_flush_secs` | 用量落盘间隔（秒），默认 `10` |
+| `state_file` | 可选；省略整节则不持久化用量（重启归零）。子字段：`enabled`（默认 `true`，设 `false` 临时关闭）、`path`（SQLite 数据库路径，默认 `state.db`，相对运行目录）、`flush_secs`（落盘间隔秒数，默认 `10`） |
 | `api` | 可选；省略则不启动查询 API。`token` 也可选，设置后所有请求都要带 token |
 | `total_quota` | 可选；未设置 `quota` 的用户平分这个总量 |
 | `rules` | 单用户简写：顶层规则列表，等价于一个名为 `default` 的用户；与 `users` 互斥 |
@@ -208,7 +212,7 @@ users:
 **新**连接/会话在旧 TTL 过期后即用新地址，无需重启；已建立的连接不受影响，自然走完。
 IP 字面量（含 `[::1]:80` 形式的 IPv6）不经过 DNS。域名或端口格式非法会在启动时报错。
 
-配额修改（包括增加流量）在**重启后生效**；已用量从数据库恢复，所以重启不会重置配额。
+配额修改（包括增加流量）在**重启后生效**；启用 `state_file` 时已用量从数据库恢复，重启不会重置计数。
 
 ## 查询 API
 

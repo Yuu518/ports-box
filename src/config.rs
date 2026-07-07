@@ -8,10 +8,8 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    #[serde(default = "default_state_db")]
-    pub state_db: PathBuf,
-    #[serde(default = "default_flush_secs")]
-    pub state_flush_secs: u64,
+    #[serde(default)]
+    pub state_file: Option<StateFileConfig>,
     #[serde(default)]
     pub api: Option<ApiConfig>,
     #[serde(default)]
@@ -22,6 +20,19 @@ pub struct Config {
     pub rules: Vec<Rule>,
     #[serde(default)]
     pub users: Vec<UserConfig>,
+}
+
+/// Optional usage persistence. Omitting the whole section keeps counters
+/// in memory only, so they reset on restart.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateFileConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_state_path")]
+    pub path: PathBuf,
+    #[serde(default = "default_flush_secs")]
+    pub flush_secs: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -131,7 +142,7 @@ fn check_target(target: &str) -> Result<(), String> {
     crate::dns::split_target(target).map(|_| ())
 }
 
-fn default_state_db() -> PathBuf {
+fn default_state_path() -> PathBuf {
     PathBuf::from("state.db")
 }
 
@@ -256,8 +267,10 @@ fn validate(config: &Config) -> Result<(), String> {
     if config.users.is_empty() {
         return Err("config has no users or rules".into());
     }
-    if config.state_flush_secs == 0 {
-        return Err("state_flush_secs must be at least 1".into());
+    if let Some(state) = &config.state_file
+        && state.flush_secs == 0
+    {
+        return Err("state_file flush_secs must be at least 1".into());
     }
 
     let mut names = HashSet::new();
@@ -576,6 +589,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resolve_quotas(&config)["default"], Some(1 << 20));
+    }
+
+    #[test]
+    fn state_file_defaults_to_none() {
+        let config = parse_config(
+            r#"{"rules": [{"listen": "0.0.0.0:1", "target": "x:1"}]}"#,
+        )
+        .unwrap();
+        assert!(config.state_file.is_none());
+    }
+
+    #[test]
+    fn empty_state_file_section_uses_defaults() {
+        let config = parse_config(
+            r#"{"state_file": {}, "rules": [{"listen": "0.0.0.0:1", "target": "x:1"}]}"#,
+        )
+        .unwrap();
+        let state = config.state_file.unwrap();
+        assert!(state.enabled);
+        assert_eq!(state.path, PathBuf::from("state.db"));
+        assert_eq!(state.flush_secs, 10);
+    }
+
+    #[test]
+    fn state_file_disabled_and_zero_flush_secs() {
+        let config = parse_config(
+            r#"{"state_file": {"enabled": false}, "rules": [{"listen": "0.0.0.0:1", "target": "x:1"}]}"#,
+        )
+        .unwrap();
+        assert!(!config.state_file.unwrap().enabled);
+
+        let err = parse_config(
+            r#"{"state_file": {"flush_secs": 0}, "rules": [{"listen": "0.0.0.0:1", "target": "x:1"}]}"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("flush_secs"), "{err}");
     }
 
     #[test]

@@ -1,6 +1,9 @@
 {
-  "state_db": "state.db",
-  "state_flush_secs": 10,
+  "state_file": {
+    "enabled": true,
+    "path": "state.db",
+    "flush_secs": 10
+  },
   "api": {
     "listen": "127.0.0.1:7070",
     "token": "changeme"
