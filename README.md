@@ -102,7 +102,7 @@ image: ports-box:local
 
 ## 配置文件
 
-支持 JSON 和 YAML 两种格式，按扩展名区分（`.yaml`/`.yml` 为 YAML，其余为 JSON），字段完全相同。
+支持 JSON 和 YAML 两种格式，按扩展名区分（`.yaml`/`.yml` 为 YAML，其余为 JSON），字段完全相同。JSON 按 [JSON5](https://json5.org/) 解析（严格 JSON 的超集）：允许注释（`//`、`/* */`）、尾随逗号、不带引号的键名、单引号字符串。
 
 最简配置——单人使用、单纯转发、不限流量，顶层直接写 `rules` 即可（内部等价于一个名为 `default` 的用户，与 `users` 字段互斥；设了 `total_quota` 就是它的配额）：
 

@@ -241,7 +241,9 @@ pub fn load(path: &Path) -> Result<Config, String> {
         serde_yaml_ng::from_str(&raw)
             .map_err(|e| format!("invalid config {}: {e}", path.display()))?
     } else {
-        serde_json::from_str(&raw)
+        // JSON5: a JSON superset with comments, trailing commas, unquoted
+        // keys, and single-quoted strings.
+        json5::from_str(&raw)
             .map_err(|e| format!("invalid config {}: {e}", path.display()))?
     };
     finalize(config)
@@ -346,8 +348,7 @@ mod tests {
     use super::*;
 
     fn parse_config(json: &str) -> Result<Config, String> {
-        let config: Config =
-            serde_json::from_str(json).map_err(|e| e.to_string())?;
+        let config: Config = json5::from_str(json).map_err(|e| e.to_string())?;
         finalize(config)
     }
 
@@ -707,6 +708,25 @@ users:
         let good = dir.path().join("config.yaml");
         std::fs::write(&good, yaml).unwrap();
         load(&good).unwrap();
+    }
+
+    #[test]
+    fn json5_syntax_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{
+                // line comment
+                total_quota: '1MB', /* block comment */
+                rules: [
+                    {listen: "0.0.0.0:1", target: "x:1"},
+                ],
+            }"#,
+        )
+        .unwrap();
+        let config = load(&path).unwrap();
+        assert_eq!(config.total_quota, Some(ByteSize(1 << 20)));
     }
 
     #[test]
