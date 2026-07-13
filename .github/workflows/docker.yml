@@ -2,6 +2,7 @@ name: Docker image building
 
 on:
   push:
+    tags: ["v*"]
   workflow_dispatch:
 
 env:
@@ -16,24 +17,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Read package version
+      - name: Read version from tag
         id: package
         shell: bash
         run: |
-          version="$(awk '
-            /^\[package\]$/ { in_package = 1; next }
-            /^\[/ { in_package = 0 }
-            in_package && /^version[[:space:]]*=/ {
-              gsub(/"/, "", $3)
-              print $3
-              exit
-            }
-          ' Cargo.toml)"
-          if [ -z "$version" ]; then
-            echo "Cannot read package version from Cargo.toml" >&2
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then
+            echo "Not running on a v* tag (got $GITHUB_REF); dispatch this workflow on a tag" >&2
             exit 1
           fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
