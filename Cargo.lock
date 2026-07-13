@@ -1006,7 +1006,7 @@ checksum = "c33a9471896f1c69cecef8d20cbe2f7accd12527ce60845ff44c153bb2a21b49"
 
 [[package]]
 name = "ports-box"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "axum",
  "clap",
@@ -1017,6 +1017,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "socket2",
  "tempfile",
  "tokio",
  "tower",

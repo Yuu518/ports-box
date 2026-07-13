@@ -1,6 +1,8 @@
 use std::io;
 use std::sync::Arc;
+use std::time::Duration;
 
+use socket2::{SockRef, TcpKeepalive};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
@@ -10,6 +12,18 @@ use crate::pool::{TargetPool, CONNECT_TIMEOUT};
 use crate::quota::{exhausted, Direction, UserQuota};
 
 const COPY_BUF: usize = 64 * 1024;
+// Probe after 60s of silence, then every 10s; the kernel's default retry
+// count reaps dead peers in roughly two minutes without touching
+// legitimately idle connections.
+const KEEPALIVE_TIME: Duration = Duration::from_secs(60);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
+fn set_keepalive(stream: &TcpStream) {
+    let ka = TcpKeepalive::new()
+        .with_time(KEEPALIVE_TIME)
+        .with_interval(KEEPALIVE_INTERVAL);
+    let _ = SockRef::from(stream).set_tcp_keepalive(&ka);
+}
 
 pub async fn serve(listener: TcpListener, pool: Arc<TargetPool>, quota: Arc<UserQuota>) {
     loop {
@@ -74,6 +88,8 @@ async fn handle(client: TcpStream, pool: &Arc<TargetPool>, quota: &UserQuota) ->
     let upstream = connect_active(pool).await?;
     let _ = client.set_nodelay(true);
     let _ = upstream.set_nodelay(true);
+    set_keepalive(&client);
+    set_keepalive(&upstream);
 
     let (client_r, client_w) = client.into_split();
     let (upstream_r, upstream_w) = upstream.into_split();
@@ -121,6 +137,22 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn keepalive_is_enabled_on_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let _ = listener.accept().await.unwrap();
+        });
+        let stream = TcpStream::connect(addr).await.unwrap();
+        assert!(!SockRef::from(&stream).keepalive().unwrap());
+
+        set_keepalive(&stream);
+
+        assert!(SockRef::from(&stream).keepalive().unwrap());
+        accept.await.unwrap();
+    }
 
     #[tokio::test]
     async fn connect_success_recovers_pinned_primary() {
