@@ -1,10 +1,8 @@
 /target
 
-# 运行时产物
 state.db
 state.db-wal
 state.db-shm
 
-# 真实配置（含 token），仓库只保留 config.example.json
 config.json
 .claude/
