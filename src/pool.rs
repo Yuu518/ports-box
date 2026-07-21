@@ -168,9 +168,8 @@ pub async fn probe_task(pools: Vec<(Arc<TargetPool>, Duration)>) {
                     continue;
                 }
                 let target = pool.targets[i].clone();
-                let connect = async {
-                    TcpStream::connect(crate::dns::resolve(&target).await?).await
-                };
+                let connect =
+                    async { TcpStream::connect(crate::dns::resolve(&target).await?).await };
                 match timeout(CONNECT_TIMEOUT, connect).await {
                     Ok(Ok(_)) => pool.confirm(i),
                     _ => pool.mark_down(i),
@@ -265,10 +264,7 @@ mod tests {
         pool.mark_down(0);
         assert_eq!(pool.pick().0, 1);
 
-        let probe = tokio::spawn(probe_task(vec![(
-            pool.clone(),
-            Duration::from_millis(50),
-        )]));
+        let probe = tokio::spawn(probe_task(vec![(pool.clone(), Duration::from_millis(50))]));
         timeout(Duration::from_secs(5), async {
             while pool.pick().0 != 0 {
                 rx.changed().await.unwrap();
@@ -286,10 +282,7 @@ mod tests {
         // No traffic ever confirms this dead target, so the prober is the
         // only thing that can notice it.
         let pool = TargetPool::new("a".into(), vec!["127.0.0.1:1".into()], None);
-        let probe = tokio::spawn(probe_task(vec![(
-            pool.clone(),
-            Duration::from_millis(50),
-        )]));
+        let probe = tokio::spawn(probe_task(vec![(pool.clone(), Duration::from_millis(50))]));
         timeout(Duration::from_secs(5), async {
             while pool.is_healthy(0) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -305,10 +298,7 @@ mod tests {
         // The target is unreachable, but traffic keeps confirming it, so
         // the prober must leave it alone.
         let pool = TargetPool::new("a".into(), vec!["127.0.0.1:1".into()], None);
-        let probe = tokio::spawn(probe_task(vec![(
-            pool.clone(),
-            Duration::from_millis(100),
-        )]));
+        let probe = tokio::spawn(probe_task(vec![(pool.clone(), Duration::from_millis(100))]));
         for _ in 0..15 {
             pool.confirm(0);
             tokio::time::sleep(Duration::from_millis(20)).await;

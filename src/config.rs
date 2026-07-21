@@ -200,9 +200,7 @@ pub fn parse_size(s: &str) -> Result<u64, String> {
         .find(|c: char| !c.is_ascii_digit() && c != '.')
         .unwrap_or(s.len());
     let (num, unit) = s.split_at(split);
-    let num: f64 = num
-        .parse()
-        .map_err(|_| format!("invalid size: {s:?}"))?;
+    let num: f64 = num.parse().map_err(|_| format!("invalid size: {s:?}"))?;
     let unit = unit.trim().to_ascii_uppercase();
     let mult: u64 = match unit.as_str() {
         "" | "B" => 1,
@@ -243,8 +241,7 @@ pub fn load(path: &Path) -> Result<Config, String> {
     } else {
         // JSON5: a JSON superset with comments, trailing commas, unquoted
         // keys, and single-quoted strings.
-        json5::from_str(&raw)
-            .map_err(|e| format!("invalid config {}: {e}", path.display()))?
+        json5::from_str(&raw).map_err(|e| format!("invalid config {}: {e}", path.display()))?
     };
     finalize(config)
 }
@@ -360,7 +357,10 @@ mod tests {
         assert_eq!(parse_size("10GB").unwrap(), 10 << 30);
         assert_eq!(parse_size("10 GiB").unwrap(), 10 << 30);
         assert_eq!(parse_size("1tb").unwrap(), 1 << 40);
-        assert_eq!(parse_size("1.5GB").unwrap(), (1.5 * (1u64 << 30) as f64) as u64);
+        assert_eq!(
+            parse_size("1.5GB").unwrap(),
+            (1.5 * (1u64 << 30) as f64) as u64
+        );
         assert!(parse_size("10XB").is_err());
         assert!(parse_size("abc").is_err());
         assert!(parse_size("").is_err());
@@ -574,10 +574,8 @@ mod tests {
 
     #[test]
     fn top_level_rules_make_default_user() {
-        let config = parse_config(
-            r#"{"rules": [{"listen": "0.0.0.0:1", "target": "x:1"}]}"#,
-        )
-        .unwrap();
+        let config =
+            parse_config(r#"{"rules": [{"listen": "0.0.0.0:1", "target": "x:1"}]}"#).unwrap();
         assert_eq!(config.users.len(), 1);
         assert_eq!(config.users[0].name, "default");
         assert_eq!(config.users[0].rules.len(), 1);
@@ -594,10 +592,8 @@ mod tests {
 
     #[test]
     fn state_file_defaults_to_none() {
-        let config = parse_config(
-            r#"{"rules": [{"listen": "0.0.0.0:1", "target": "x:1"}]}"#,
-        )
-        .unwrap();
+        let config =
+            parse_config(r#"{"rules": [{"listen": "0.0.0.0:1", "target": "x:1"}]}"#).unwrap();
         assert!(config.state_file.is_none());
     }
 

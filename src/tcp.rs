@@ -8,8 +8,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
-use crate::pool::{TargetPool, CONNECT_TIMEOUT};
-use crate::quota::{exhausted, Direction, UserQuota};
+use crate::pool::{CONNECT_TIMEOUT, TargetPool};
+use crate::quota::{Direction, UserQuota, exhausted};
 
 const COPY_BUF: usize = 64 * 1024;
 // Probe after 60s of silence, then every 10s; the kernel's default retry
@@ -55,9 +55,7 @@ async fn connect_active(pool: &Arc<TargetPool>) -> io::Result<TcpStream> {
     for _ in 0..pool.len() {
         let (i, target) = pool.pick();
         // The timeout covers DNS resolution plus the connect itself.
-        let connect = async {
-            TcpStream::connect(crate::dns::resolve(&target).await?).await
-        };
+        let connect = async { TcpStream::connect(crate::dns::resolve(&target).await?).await };
         match timeout(CONNECT_TIMEOUT, connect).await {
             Ok(Ok(stream)) => {
                 pool.confirm(i);
@@ -161,11 +159,7 @@ mod tests {
         let accept = tokio::spawn(async move {
             let _ = listener.accept().await.unwrap();
         });
-        let pool = TargetPool::new(
-            "a".into(),
-            vec![primary, "127.0.0.1:1".into()],
-            None,
-        );
+        let pool = TargetPool::new("a".into(), vec![primary, "127.0.0.1:1".into()], None);
         // All targets down pins the active index to the primary; a real
         // connection succeeding must mark it healthy again.
         pool.mark_down(0);

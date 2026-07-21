@@ -10,6 +10,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time"
 serde = { version = "1", features = ["derive"] }
 json5 = "0.4"
 serde_yaml_ng = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
 axum = "0.8"
 rusqlite = { version = "0.37", features = ["bundled"] }

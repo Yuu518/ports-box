@@ -5,7 +5,7 @@ A TCP/UDP port forwarder for Linux with per-user traffic quotas.
 - **Users as groups**: each username is a group that can hold multiple port-forwarding rules, and every rule can be enabled/disabled individually; for single-user setups, just write `rules` at the top level
 - **Failover (fallback)**: each rule can have multiple backup targets — when the primary target is unavailable it automatically switches by priority and switches back once the primary recovers; rules that include TCP detect recovery via background health checks (every 10 seconds by default)
 - **Domain name resolution**: forwarding targets can be domain names, resolved using the host's DNS configuration (`/etc/resolv.conf`, `/etc/hosts`) and cached according to record TTL — after a domain's records change, new connections automatically use the new address without a restart
-- **Traffic quotas (optional)**: quotas can be set per user, or a single `total_quota` can be split evenly among users without an individual quota; if neither is set, that user is **unlimited** (usage is recorded but not enforced); usage is billed as the **larger of inbound and outbound** (`max(upload, download)`)
+- **Traffic quotas (optional)**: quotas can be set per user, or a single `total_quota` can be split evenly among users without an individual quota; if neither is set, that user is **unlimited** (usage is recorded but not enforced); usage follows the carrier billing model — each **local wall-clock hour** is a billing period charged as the **larger of inbound and outbound** in that hour (`max(upload, download)`), and billed usage is the sum over hours
 - **Hard stop on quota exhaustion**: new connections are rejected, in-flight connections are closed immediately, UDP packets are dropped; service resumes after raising the quota and restarting
 - **Usage persistence (optional)**: with `state_file` configured, used traffic is stored in a SQLite database (flushed every 10 seconds by default and on exit), so counters survive restarts; without it, usage is kept in memory only and resets to zero on restart
 - **Query API**: an HTTP interface returns each user's total/used/remaining traffic; compatible with Sub-Store (`subscription-userinfo` response header)
@@ -226,8 +226,10 @@ The token is carried via the `Authorization: Bearer <token>` header or the `?tok
 
 ```sh
 $ curl "http://127.0.0.1:7070/api/users/alice?token=changeme"
-{"name":"alice","total":"30.00GB","used":"1.00MB","remaining":"29.99GB"}
+{"name":"alice","total":"30.00GB","used":"1.00MB","hour_used":"120.00KB","remaining":"29.99GB"}
 ```
+
+`used` is the billed total (sum of each hour's larger direction); `hour_used` is the current hour's billed traffic so far.
 
 For unlimited users, `total` / `remaining` return `"unlimited"`; the Sub-Store endpoint omits the `total=` field.
 

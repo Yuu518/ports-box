@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -24,6 +24,7 @@ struct UserUsage {
     name: String,
     total: String,
     used: String,
+    hour_used: String,
     remaining: String,
 }
 
@@ -33,22 +34,17 @@ impl From<&UserQuota> for UserUsage {
             name: q.name.clone(),
             total: q.limit.map_or_else(|| "unlimited".into(), format_size),
             used: format_size(q.used()),
-            remaining: q.remaining().map_or_else(|| "unlimited".into(), format_size),
+            hour_used: format_size(q.hour_used()),
+            remaining: q
+                .remaining()
+                .map_or_else(|| "unlimited".into(), format_size),
         }
     }
 }
 
-pub fn router(
-    users: Arc<Vec<Arc<UserQuota>>>,
-    token: Option<String>,
-) -> Router {
+pub fn router(users: Arc<Vec<Arc<UserQuota>>>, token: Option<String>) -> Router {
     let state = ApiState {
-        users: Arc::new(
-            users
-                .iter()
-                .map(|u| (u.name.clone(), u.clone()))
-                .collect(),
-        ),
+        users: Arc::new(users.iter().map(|u| (u.name.clone(), u.clone())).collect()),
         ordered: users,
         token: token.map(Into::into),
     };
@@ -65,7 +61,9 @@ fn authorize(state: &ApiState, headers: &HeaderMap, query: &HashMap<String, Stri
     let Some(expected) = &state.token else {
         return true;
     };
-    if let Some(auth) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok())
+    if let Some(auth) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
         && auth.strip_prefix("Bearer ") == Some(expected)
     {
         return true;
@@ -132,17 +130,30 @@ async fn sub_store(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quota::Direction;
+    use crate::quota::{Direction, SavedUsage};
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt as _;
 
+    /// Fixed hour id so tests never straddle a real boundary.
+    const H: i64 = 500_000;
+
     fn test_router(token: Option<String>) -> Router {
-        let alice = Arc::new(UserQuota::new("alice".into(), Some(1000), 0, 0));
-        alice.try_consume(100, Direction::Upload);
-        alice.try_consume(200, Direction::Download);
-        let bob = Arc::new(UserQuota::new("bob".into(), None, 0, 0));
-        bob.try_consume(50, Direction::Upload);
+        let alice = Arc::new(UserQuota::new_at(
+            "alice".into(),
+            Some(1000),
+            SavedUsage::default(),
+            H,
+        ));
+        alice.try_consume_at(100, Direction::Upload, H);
+        alice.try_consume_at(200, Direction::Download, H);
+        let bob = Arc::new(UserQuota::new_at(
+            "bob".into(),
+            None,
+            SavedUsage::default(),
+            H,
+        ));
+        bob.try_consume_at(50, Direction::Upload, H);
         router(Arc::new(vec![alice, bob]), token)
     }
 
@@ -163,17 +174,21 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let json = body_json(response).await;
-        // used = max(upload, download)
+        // used = max(upload, download) within the single billing hour
         assert_eq!(
             json,
             serde_json::json!([
-                {"name": "alice", "total": "1000B", "used": "200B", "remaining": "800B"},
-                {"name": "bob", "total": "unlimited", "used": "50B", "remaining": "unlimited"}
+                {"name": "alice", "total": "1000B", "used": "200B", "hour_used": "200B", "remaining": "800B"},
+                {"name": "bob", "total": "unlimited", "used": "50B", "hour_used": "50B", "remaining": "unlimited"}
             ])
         );
 
         let response = app
-            .oneshot(Request::get("/api/users/missing").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/api/users/missing")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);

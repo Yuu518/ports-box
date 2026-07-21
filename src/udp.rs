@@ -11,7 +11,7 @@ use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use crate::pool::TargetPool;
-use crate::quota::{exhausted, Direction, UserQuota};
+use crate::quota::{Direction, UserQuota, exhausted};
 
 const RECV_BUF: usize = 64 * 1024;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -168,7 +168,9 @@ async fn relay_downstream(
             Err(_) => {
                 // No reply within the window; the client side may still be
                 // active (its packets flow through the main loop).
-                let idle = epoch.now_ms().saturating_sub(session.last_active.load(Ordering::Relaxed));
+                let idle = epoch
+                    .now_ms()
+                    .saturating_sub(session.last_active.load(Ordering::Relaxed));
                 if idle >= IDLE_TIMEOUT.as_millis() as u64 {
                     break;
                 }

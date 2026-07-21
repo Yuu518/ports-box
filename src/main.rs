@@ -100,8 +100,8 @@ async fn run(args: Args) -> Result<(), String> {
     let mut users: Vec<Arc<UserQuota>> = Vec::new();
     for user in &config.users {
         let limit = quotas[&user.name];
-        let (upload, download) = saved.get(&user.name).copied().unwrap_or((0, 0));
-        let quota = Arc::new(UserQuota::new(user.name.clone(), limit, upload, download));
+        let usage = saved.get(&user.name).copied().unwrap_or_default();
+        let quota = Arc::new(UserQuota::new(user.name.clone(), limit, usage));
         match limit {
             None => info!(
                 user = %user.name,
@@ -140,8 +140,8 @@ async fn run(args: Args) -> Result<(), String> {
             let check_interval = Duration::from_secs(rule.check_secs);
             // UDP-only targets cannot be probed over TCP; they recover via
             // a retry cooldown instead of the probe task.
-            let cooldown = (!rule.fallback.is_empty() && !rule.protocol.tcp())
-                .then_some(check_interval);
+            let cooldown =
+                (!rule.fallback.is_empty() && !rule.protocol.tcp()).then_some(check_interval);
             let pool = TargetPool::new(user.name.clone(), targets, cooldown);
             if !rule.fallback.is_empty() && rule.protocol.tcp() {
                 probes.push((pool.clone(), check_interval));
@@ -213,7 +213,7 @@ async fn run(args: Args) -> Result<(), String> {
 
 #[cfg(unix)]
 async fn wait_for_shutdown() {
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
     let mut sigterm = signal(SignalKind::terminate()).expect("cannot install SIGTERM handler");
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
