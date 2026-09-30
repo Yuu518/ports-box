@@ -1,9 +1,10 @@
 name: Docker image building
 
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
+  push:
+    branches:
+      - master
 
 env:
   IMAGE_NAME: ports-box
