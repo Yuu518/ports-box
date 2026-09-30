@@ -138,9 +138,7 @@ impl UserQuota {
         if self.is_exhausted() {
             return false;
         }
-        if self.bucket_hour.load(Ordering::Relaxed) != now_hour {
-            self.settle_to(now_hour);
-        }
+        self.roll_over_at(now_hour);
         let (total, bucket) = match direction {
             Direction::Upload => (&self.total_upload, &self.hour_upload),
             Direction::Download => (&self.total_download, &self.hour_download),
@@ -154,6 +152,12 @@ impl UserQuota {
             return false;
         }
         true
+    }
+
+    pub(crate) fn roll_over_at(&self, now_hour: i64) {
+        if self.bucket_hour.load(Ordering::Relaxed) != now_hour {
+            self.settle_to(now_hour);
+        }
     }
 
     /// Folds the finished hour's bucket into `settled`. `used()` reads the
@@ -351,6 +355,17 @@ mod tests {
         assert!(!quota.try_consume_at(30, Direction::Upload, H + 1));
         assert!(quota.is_exhausted());
         assert!(!quota.try_consume_at(1, Direction::Upload, H + 2));
+    }
+
+    #[test]
+    fn roll_over_without_traffic_resets_hour() {
+        let quota = quota(Some(1000));
+        assert!(quota.try_consume_at(70, Direction::Upload, H));
+        quota.roll_over_at(H);
+        assert_eq!(quota.hour_used(), 70);
+        quota.roll_over_at(H + 1);
+        assert_eq!(quota.hour_used(), 0);
+        assert_eq!(quota.used(), 70);
     }
 
     #[test]

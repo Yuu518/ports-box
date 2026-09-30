@@ -78,7 +78,40 @@ fn main() -> ExitCode {
     }
 }
 
+#[cfg(unix)]
+fn raise_nofile_limit() {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0
+        || limit.rlim_cur >= limit.rlim_max
+    {
+        return;
+    }
+    let raised = libc::rlimit {
+        rlim_cur: limit.rlim_max,
+        rlim_max: limit.rlim_max,
+    };
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+        info!(
+            "open file limit raised from {} to {}",
+            limit.rlim_cur, raised.rlim_cur
+        );
+    } else {
+        warn!(
+            "cannot raise open file limit from {}: {}",
+            limit.rlim_cur,
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn raise_nofile_limit() {}
+
 async fn run(args: Args) -> Result<(), String> {
+    raise_nofile_limit();
     let config = config::load(&args.config)?;
     let quotas = config::resolve_quotas(&config);
 
@@ -170,8 +203,6 @@ async fn run(args: Args) -> Result<(), String> {
         }
     }
     if !probes.is_empty() {
-        // One shared prober for every rule: probes run serially so a large
-        // rule count never bursts simultaneous connects.
         tokio::spawn(pool::probe_task(probes));
     }
 
@@ -180,6 +211,12 @@ async fn run(args: Args) -> Result<(), String> {
             .await
             .map_err(|e| format!("cannot bind api {}: {e}", api.listen))?;
         info!("api listening on http://{}", api.listen);
+        if api.token.is_none() && !api.listen.ip().is_loopback() {
+            warn!(
+                "api on {} has no token: anyone who can reach it can read usage",
+                api.listen
+            );
+        }
         let router = api::router(users.clone(), api.token.clone());
         tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, router).await {

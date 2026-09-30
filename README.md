@@ -24,6 +24,8 @@ cargo build --release
 
 The log level is controlled via `RUST_LOG` (default `ports_box=info`). On SIGTERM / SIGINT, usage is written to the database before exiting.
 
+Every forwarded TCP connection holds two file descriptors and every UDP session one, so at startup the process raises its soft open-file limit (`RLIMIT_NOFILE`) to the hard limit. The bundled systemd unit sets `LimitNOFILE=1048576`.
+
 ## Docker image
 
 The image is built by GitHub Actions and pushed to Docker Hub. The repository needs the following Secrets:
@@ -40,7 +42,7 @@ After pushing to `main` / `master`, or manually running the `Docker` workflow, t
 <DOCKERHUB_USERNAME>/ports-box:latest
 ```
 
-The current version number comes from `package.version` in `Cargo.toml`.
+The current version number comes from `package.version` in `Cargo.toml`; when the workflow runs on a `v*` tag, the tag must match that version.
 
 ## Docker Compose
 
@@ -49,7 +51,10 @@ First prepare the config file and data directory:
 ```sh
 cp config.example.json config.json
 mkdir -p data
+sudo chown 10001:10001 data
 ```
+
+The container runs as the unprivileged user `ports-box` (UID/GID `10001`), so the data directory must be writable by that UID, otherwise `state.db` cannot be created. The binary carries the `cap_net_bind_service` file capability, so it can bind ports below 1024 even under host networking; if you run the container with `--cap-drop ALL`, add `--cap-add NET_BIND_SERVICE` back or the binary will fail to start.
 
 Create `compose.yaml`:
 
@@ -201,6 +206,9 @@ Traffic values can be written as integers (bytes) or strings: `"500MB"`, `"10GB"
 **Fallback behavior**: targets are tried in priority order `target` → `fallback[0]` → `fallback[1]` …, and the first healthy one is used.
 A connection failure (including the 5-second timeout) immediately moves to the next target; once a higher-priority target recovers (detected by health checks), **new** connections automatically switch back — established TCP connections are not interrupted and finish naturally, while UDP sessions are actively terminated so the client's next packet goes back to the primary target. When all targets are down, the primary target keeps being retried.
 Pure `udp` rules cannot be probed (the target may not listen on TCP), so they fall back to a passive mode: a failed target cools down for `check_secs` seconds and is retried by new sessions, making the switch-back granularity roughly equal to that cooldown.
+Health checks for all rules run in parallel, with at most 16 probes in flight at once.
+
+**UDP sessions**: each client address gets its own upstream session, closed after 60 seconds without traffic. Sessions are established in the background, so a slow DNS lookup or dead target never delays other clients; packets arriving meanwhile are queued (up to 32) and sent in order once connected. Each `listen` address keeps at most 4096 concurrent sessions; packets from new clients beyond that are dropped.
 
 ```json
 { "listen": "0.0.0.0:8080", "target": "10.0.0.2:80", "fallback": ["10.0.0.3:80", "10.0.0.4:80"] }
@@ -216,7 +224,7 @@ Quota changes (including adding traffic) take effect **after a restart**; with `
 
 ## Query API
 
-The token is carried via the `Authorization: Bearer <token>` header or the `?token=<token>` query parameter.
+The token is carried via the `Authorization: Bearer <token>` header or the `?token=<token>` query parameter. If the API listens on a non-loopback address without a token, a warning is logged at startup.
 
 | Endpoint | Description |
 |---|---|
@@ -235,6 +243,7 @@ For unlimited users, `total` / `remaining` return `"unlimited"`; the Sub-Store e
 
 **Sub-Store usage**: use `http://<host>:7070/sub/alice?token=changeme` as the subscription URL; Sub-Store reads traffic information from the
 `subscription-userinfo: upload=…; download=…; total=…` response header.
+Sub-Store treats `upload + download` as used traffic, so the endpoint reports the **billed** usage split between the two directions in proportion to the raw traffic: `upload + download` always equals `used`, and the remaining amount Sub-Store shows matches the API.
 
 ## Deploying to Linux (/opt/forwarder)
 

@@ -12,6 +12,7 @@ use crate::pool::{CONNECT_TIMEOUT, TargetPool};
 use crate::quota::{Direction, UserQuota, exhausted};
 
 const COPY_BUF: usize = 64 * 1024;
+const ACCEPT_BACKOFF: Duration = Duration::from_secs(1);
 // Probe after 60s of silence, then every 10s; the kernel's default retry
 // count reaps dead peers in roughly two minutes without touching
 // legitimately idle connections.
@@ -29,8 +30,13 @@ pub async fn serve(listener: TcpListener, pool: Arc<TargetPool>, quota: Arc<User
     loop {
         let (client, peer) = match listener.accept().await {
             Ok(conn) => conn,
+            Err(e) if is_connection_error(&e) => {
+                debug!(user = %quota.name, "tcp accept failed: {e}");
+                continue;
+            }
             Err(e) => {
-                warn!(user = %quota.name, "tcp accept failed: {e}");
+                warn!(user = %quota.name, "tcp accept failed, backing off: {e}");
+                tokio::time::sleep(ACCEPT_BACKOFF).await;
                 continue;
             }
         };
@@ -48,6 +54,15 @@ pub async fn serve(listener: TcpListener, pool: Arc<TargetPool>, quota: Arc<User
     }
 }
 
+fn is_connection_error(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+    )
+}
+
 /// Connects to the pool's active target, falling through the priority list
 /// on failure. Gives up once the active index stops moving (all down).
 async fn connect_active(pool: &Arc<TargetPool>) -> io::Result<TcpStream> {
@@ -55,8 +70,7 @@ async fn connect_active(pool: &Arc<TargetPool>) -> io::Result<TcpStream> {
     for _ in 0..pool.len() {
         let (i, target) = pool.pick();
         // The timeout covers DNS resolution plus the connect itself.
-        let connect = async { TcpStream::connect(crate::dns::resolve(&target).await?).await };
-        match timeout(CONNECT_TIMEOUT, connect).await {
+        match timeout(CONNECT_TIMEOUT, crate::dns::connect_tcp(&target)).await {
             Ok(Ok(stream)) => {
                 pool.confirm(i);
                 return Ok(stream);
@@ -135,6 +149,86 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::quota::SavedUsage;
+
+    async fn echo_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let (mut r, mut w) = stream.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+        addr
+    }
+
+    async fn forwarder(targets: Vec<String>, quota: Arc<UserQuota>) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let pool = TargetPool::new("a".into(), targets, None);
+        tokio::spawn(serve(listener, pool, quota));
+        addr
+    }
+
+    async fn roundtrip(stream: &mut TcpStream, payload: &[u8]) {
+        stream.write_all(payload).await.unwrap();
+        let mut buf = vec![0u8; payload.len()];
+        timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(buf, payload);
+    }
+
+    #[tokio::test]
+    async fn forwards_and_counts_both_directions() {
+        let quota = Arc::new(UserQuota::new("a".into(), None, SavedUsage::default()));
+        let addr = forwarder(vec![echo_server().await], quota.clone()).await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+
+        roundtrip(&mut stream, b"hello").await;
+
+        assert_eq!((quota.upload(), quota.download()), (5, 5));
+    }
+
+    #[tokio::test]
+    async fn fails_over_to_fallback_target() {
+        let quota = Arc::new(UserQuota::new("a".into(), None, SavedUsage::default()));
+        let dead = {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap().to_string()
+        };
+        let addr = forwarder(vec![dead, echo_server().await], quota).await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+
+        roundtrip(&mut stream, b"ping").await;
+    }
+
+    #[tokio::test]
+    async fn exhaustion_drops_live_and_new_connections() {
+        let quota = Arc::new(UserQuota::new("a".into(), Some(10), SavedUsage::default()));
+        let addr = forwarder(vec![echo_server().await], quota.clone()).await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        roundtrip(&mut stream, b"12345").await;
+
+        stream.write_all(&[0u8; 20]).await.unwrap();
+        let mut buf = [0u8; 64];
+        let read = timeout(Duration::from_secs(5), stream.read(&mut buf))
+            .await
+            .unwrap();
+        assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+        assert!(quota.is_exhausted());
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let read = timeout(Duration::from_secs(5), stream.read(&mut buf))
+            .await
+            .unwrap();
+        assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+    }
 
     #[tokio::test]
     async fn keepalive_is_enabled_on_stream() {

@@ -5,6 +5,7 @@ use std::sync::OnceLock;
 use hickory_resolver::config::ResolverConfig;
 use hickory_resolver::name_server::TokioConnectionProvider;
 use hickory_resolver::{Resolver, TokioResolver};
+use tokio::net::TcpStream;
 use tracing::warn;
 
 /// Process-wide resolver built from the host's DNS configuration
@@ -26,24 +27,33 @@ fn resolver() -> &'static TokioResolver {
     })
 }
 
-/// Resolves a `host:port` target to a socket address. IP literals (including
-/// bracketed IPv6 like `[::1]:80`) pass through without touching DNS.
-pub async fn resolve(target: &str) -> io::Result<SocketAddr> {
+/// Resolves a `host:port` target to its socket addresses. IP literals
+/// (including bracketed IPv6 like `[::1]:80`) pass through without touching
+/// DNS.
+pub async fn resolve(target: &str) -> io::Result<Vec<SocketAddr>> {
     if let Ok(addr) = target.parse() {
-        return Ok(addr);
+        return Ok(vec![addr]);
     }
     let (host, port) = split_target(target).map_err(io::Error::other)?;
     if let Ok(ip) = host.parse::<IpAddr>() {
-        return Ok(SocketAddr::new(ip, port));
+        return Ok(vec![SocketAddr::new(ip, port)]);
     }
-    let ip = resolver()
+    let addrs: Vec<SocketAddr> = resolver()
         .lookup_ip(host)
         .await
         .map_err(|e| io::Error::other(format!("cannot resolve {host}: {e}")))?
         .iter()
-        .next()
-        .ok_or_else(|| io::Error::other(format!("no addresses for {host}")))?;
-    Ok(SocketAddr::new(ip, port))
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect();
+    if addrs.is_empty() {
+        return Err(io::Error::other(format!("no addresses for {host}")));
+    }
+    Ok(addrs)
+}
+
+pub async fn connect_tcp(target: &str) -> io::Result<TcpStream> {
+    let addrs = resolve(target).await?;
+    TcpStream::connect(addrs.as_slice()).await
 }
 
 /// Splits a `host:port` target. Only validates shape, not resolvability, so
@@ -69,19 +79,22 @@ mod tests {
     async fn ip_literals_skip_dns() {
         assert_eq!(
             resolve("10.0.0.2:80").await.unwrap(),
-            "10.0.0.2:80".parse::<SocketAddr>().unwrap(),
+            vec!["10.0.0.2:80".parse::<SocketAddr>().unwrap()],
         );
         assert_eq!(
             resolve("[::1]:80").await.unwrap(),
-            "[::1]:80".parse::<SocketAddr>().unwrap(),
+            vec!["[::1]:80".parse::<SocketAddr>().unwrap()],
         );
     }
 
     #[tokio::test]
     async fn localhost_resolves_via_hosts() {
-        let addr = resolve("localhost:8080").await.unwrap();
-        assert_eq!(addr.port(), 8080);
-        assert!(addr.ip().is_loopback());
+        let addrs = resolve("localhost:8080").await.unwrap();
+        assert!(!addrs.is_empty());
+        for addr in addrs {
+            assert_eq!(addr.port(), 8080);
+            assert!(addr.ip().is_loopback());
+        }
     }
 
     #[test]
