@@ -1,13 +1,14 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::net::TcpStream;
-use tokio::sync::watch;
-use tokio::time::timeout;
+use tokio::sync::{Semaphore, watch};
+use tokio::task::JoinSet;
+use tokio::time::{MissedTickBehavior, timeout};
 use tracing::{info, warn};
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const PROBE_CONCURRENCY: usize = 16;
 
 /// Prioritized targets for one rule, shared by its TCP and UDP sides.
 ///
@@ -21,7 +22,8 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct TargetPool {
     user: String,
     targets: Vec<Arc<str>>,
-    healthy: Mutex<Vec<bool>>,
+    healthy: Vec<AtomicBool>,
+    health_lock: Mutex<()>,
     active: watch::Sender<usize>,
     cooldown: Option<Duration>,
     /// Milliseconds since `epoch` of each target's last confirmed delivery;
@@ -33,13 +35,14 @@ pub struct TargetPool {
 impl TargetPool {
     pub fn new(user: String, targets: Vec<String>, cooldown: Option<Duration>) -> Arc<Self> {
         assert!(!targets.is_empty());
-        let healthy = vec![true; targets.len()];
+        let healthy = targets.iter().map(|_| AtomicBool::new(true)).collect();
         let (active, _) = watch::channel(0);
         let confirmed = targets.iter().map(|_| AtomicU64::new(0)).collect();
         Arc::new(Self {
             user,
             targets: targets.into_iter().map(Into::into).collect(),
-            healthy: Mutex::new(healthy),
+            healthy,
+            health_lock: Mutex::new(()),
             active,
             cooldown,
             confirmed,
@@ -64,12 +67,11 @@ impl TargetPool {
 
     pub fn mark_down(self: &Arc<Self>, i: usize) {
         {
-            let mut healthy = self.healthy.lock().unwrap();
-            if !healthy[i] {
+            let _guard = self.health_lock.lock().unwrap();
+            if !self.healthy[i].swap(false, Ordering::Relaxed) {
                 return;
             }
-            healthy[i] = false;
-            self.update_active(&healthy);
+            self.update_active();
         }
         if let Some(cooldown) = self.cooldown {
             let pool = self.clone();
@@ -81,12 +83,14 @@ impl TargetPool {
     }
 
     pub fn mark_up(&self, i: usize) {
-        let mut healthy = self.healthy.lock().unwrap();
-        if healthy[i] {
+        if self.healthy[i].load(Ordering::Relaxed) {
             return;
         }
-        healthy[i] = true;
-        self.update_active(&healthy);
+        let _guard = self.health_lock.lock().unwrap();
+        if self.healthy[i].swap(true, Ordering::Relaxed) {
+            return;
+        }
+        self.update_active();
     }
 
     /// Records a confirmed delivery to target `i` — real traffic reached it
@@ -101,7 +105,7 @@ impl TargetPool {
     /// Whether traffic can't vouch for target `i`: it is down (waiting for
     /// recovery) or hasn't had a confirmed delivery within `interval`.
     fn needs_probe(&self, i: usize, interval: Duration) -> bool {
-        if !self.healthy.lock().unwrap()[i] {
+        if !self.healthy[i].load(Ordering::Relaxed) {
             return true;
         }
         let elapsed = (self.epoch.elapsed().as_millis() as u64)
@@ -111,19 +115,23 @@ impl TargetPool {
 
     #[cfg(test)]
     pub(crate) fn is_healthy(&self, i: usize) -> bool {
-        self.healthy.lock().unwrap()[i]
+        self.healthy[i].load(Ordering::Relaxed)
     }
 
     /// Recomputes the active index while holding the health lock, so
     /// concurrent flips serialize and the watch value never goes stale.
-    fn update_active(&self, healthy: &[bool]) {
-        let next = healthy.iter().position(|&h| h).unwrap_or(0);
+    fn update_active(&self) {
+        let next = self
+            .healthy
+            .iter()
+            .position(|h| h.load(Ordering::Relaxed))
+            .unwrap_or(0);
         let prev = *self.active.borrow();
         if next == prev {
             return;
         }
         self.active.send_replace(next);
-        if !healthy[next] {
+        if !self.healthy[next].load(Ordering::Relaxed) {
             warn!(
                 user = %self.user,
                 "all targets down, retrying primary {}",
@@ -148,35 +156,39 @@ impl TargetPool {
 /// Backstop prober shared by every rule with fallbacks: when a pool's
 /// interval elapses, TCP-connects to the targets its traffic cannot vouch
 /// for — downed ones (so the active target recovers) and idle ones (so a
-/// dead target is noticed even with nothing flowing). Probes run strictly
-/// one at a time so a large rule count never bursts connections.
+/// dead target is noticed even with nothing flowing).
 pub async fn probe_task(pools: Vec<(Arc<TargetPool>, Duration)>) {
-    if pools.is_empty() {
-        return;
+    let permits = Arc::new(Semaphore::new(PROBE_CONCURRENCY));
+    let mut tasks = JoinSet::new();
+    for (pool, interval) in pools {
+        tasks.spawn(probe_pool(pool, interval, permits.clone()));
     }
-    let now = tokio::time::Instant::now();
-    let mut due: Vec<_> = pools.iter().map(|(_, interval)| now + *interval).collect();
+    while tasks.join_next().await.is_some() {}
+}
+
+async fn probe_pool(pool: Arc<TargetPool>, interval: Duration, permits: Arc<Semaphore>) {
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
-        let next = due.iter().copied().min().unwrap();
-        tokio::time::sleep_until(next).await;
-        for (k, (pool, interval)) in pools.iter().enumerate() {
-            if due[k] > tokio::time::Instant::now() {
+        ticker.tick().await;
+        let mut probes = JoinSet::new();
+        for i in 0..pool.len() {
+            if !pool.needs_probe(i, interval) {
                 continue;
             }
-            for i in 0..pool.len() {
-                if !pool.needs_probe(i, *interval) {
-                    continue;
-                }
-                let target = pool.targets[i].clone();
-                let connect =
-                    async { TcpStream::connect(crate::dns::resolve(&target).await?).await };
-                match timeout(CONNECT_TIMEOUT, connect).await {
+            let pool = pool.clone();
+            let permits = permits.clone();
+            probes.spawn(async move {
+                let Ok(_permit) = permits.acquire_owned().await else {
+                    return;
+                };
+                match timeout(CONNECT_TIMEOUT, crate::dns::connect_tcp(&pool.targets[i])).await {
                     Ok(Ok(_)) => pool.confirm(i),
                     _ => pool.mark_down(i),
                 }
-            }
-            due[k] = tokio::time::Instant::now() + *interval;
+            });
         }
+        while probes.join_next().await.is_some() {}
     }
 }
 

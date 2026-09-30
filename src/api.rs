@@ -9,7 +9,7 @@ use axum::{Json, Router};
 use serde::Serialize;
 
 use crate::config::format_size;
-use crate::quota::UserQuota;
+use crate::quota::{UserQuota, clock};
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -17,6 +17,7 @@ pub struct ApiState {
     /// Kept in insertion (config) order for stable /api/users output.
     ordered: Arc<Vec<Arc<UserQuota>>>,
     token: Option<Arc<str>>,
+    now_hour: fn() -> i64,
 }
 
 #[derive(Serialize)]
@@ -28,8 +29,9 @@ struct UserUsage {
     remaining: String,
 }
 
-impl From<&UserQuota> for UserUsage {
-    fn from(q: &UserQuota) -> Self {
+impl UserUsage {
+    fn new(q: &UserQuota, now_hour: i64) -> Self {
+        q.roll_over_at(now_hour);
         Self {
             name: q.name.clone(),
             total: q.limit.map_or_else(|| "unlimited".into(), format_size),
@@ -42,11 +44,42 @@ impl From<&UserQuota> for UserUsage {
     }
 }
 
+fn billed_split(q: &UserQuota) -> (u64, u64) {
+    let (up, down) = (q.upload(), q.download());
+    let total = up as u128 + down as u128;
+    if total == 0 {
+        return (0, 0);
+    }
+    let used = (q.used() as u128).min(total);
+    let billed_up = (used * up as u128 / total) as u64;
+    (billed_up, used as u64 - billed_up)
+}
+
+fn token_matches(given: &str, expected: &str) -> bool {
+    let (given, expected) = (given.as_bytes(), expected.as_bytes());
+    given.len() == expected.len()
+        && std::hint::black_box(
+            given
+                .iter()
+                .zip(expected)
+                .fold(0u8, |acc, (a, b)| acc | (a ^ b)),
+        ) == 0
+}
+
 pub fn router(users: Arc<Vec<Arc<UserQuota>>>, token: Option<String>) -> Router {
+    router_with_clock(users, token, clock::current_hour_id)
+}
+
+fn router_with_clock(
+    users: Arc<Vec<Arc<UserQuota>>>,
+    token: Option<String>,
+    now_hour: fn() -> i64,
+) -> Router {
     let state = ApiState {
         users: Arc::new(users.iter().map(|u| (u.name.clone(), u.clone())).collect()),
         ordered: users,
         token: token.map(Into::into),
+        now_hour,
     };
     Router::new()
         .route("/api/users", get(list_users))
@@ -64,11 +97,15 @@ fn authorize(state: &ApiState, headers: &HeaderMap, query: &HashMap<String, Stri
     if let Some(auth) = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        && auth.strip_prefix("Bearer ") == Some(expected)
+        && auth
+            .strip_prefix("Bearer ")
+            .is_some_and(|given| token_matches(given, expected))
     {
         return true;
     }
-    query.get("token").map(String::as_str) == Some(expected)
+    query
+        .get("token")
+        .is_some_and(|given| token_matches(given, expected))
 }
 
 async fn list_users(
@@ -79,7 +116,12 @@ async fn list_users(
     if !authorize(&state, &headers, &query) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let usage: Vec<UserUsage> = state.ordered.iter().map(|u| u.as_ref().into()).collect();
+    let now_hour = (state.now_hour)();
+    let usage: Vec<UserUsage> = state
+        .ordered
+        .iter()
+        .map(|u| UserUsage::new(u, now_hour))
+        .collect();
     Json(usage).into_response()
 }
 
@@ -93,7 +135,7 @@ async fn get_user(
         return StatusCode::UNAUTHORIZED.into_response();
     }
     match state.users.get(&name) {
-        Some(user) => Json(UserUsage::from(user.as_ref())).into_response(),
+        Some(user) => Json(UserUsage::new(user, (state.now_hour)())).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -112,8 +154,10 @@ async fn sub_store(
     let Some(user) = state.users.get(&name) else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    user.roll_over_at((state.now_hour)());
+    let (upload, download) = billed_split(user);
     // Unlimited users omit `total=`, which Sub-Store reads as no cap.
-    let mut userinfo = format!("upload={}; download={}", user.upload(), user.download());
+    let mut userinfo = format!("upload={upload}; download={download}");
     if let Some(limit) = user.limit {
         userinfo.push_str(&format!("; total={limit}"));
     }
@@ -139,6 +183,10 @@ mod tests {
     const H: i64 = 500_000;
 
     fn test_router(token: Option<String>) -> Router {
+        router_with_clock(test_users(), token, || H)
+    }
+
+    fn test_users() -> Arc<Vec<Arc<UserQuota>>> {
         let alice = Arc::new(UserQuota::new_at(
             "alice".into(),
             Some(1000),
@@ -154,7 +202,7 @@ mod tests {
             H,
         ));
         bob.try_consume_at(50, Direction::Upload, H);
-        router(Arc::new(vec![alice, bob]), token)
+        Arc::new(vec![alice, bob])
     }
 
     async fn body_json(response: Response) -> serde_json::Value {
@@ -204,7 +252,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.headers()["subscription-userinfo"],
-            "upload=100; download=200; total=1000"
+            "upload=66; download=134; total=1000"
         );
 
         // Unlimited users omit total entirely.
@@ -217,6 +265,43 @@ mod tests {
             response.headers()["subscription-userinfo"],
             "upload=50; download=0"
         );
+    }
+
+    #[test]
+    fn billed_split_sums_to_used() {
+        let quota = UserQuota::new_at("a".into(), None, SavedUsage::default(), H);
+        assert_eq!(billed_split(&quota), (0, 0));
+        quota.try_consume_at(300, Direction::Upload, H);
+        quota.try_consume_at(100, Direction::Download, H);
+        quota.try_consume_at(50, Direction::Download, H + 1);
+        assert_eq!(quota.used(), 350);
+        let (up, down) = billed_split(&quota);
+        assert_eq!(up + down, 350);
+        assert_eq!((up, down), (233, 117));
+    }
+
+    #[tokio::test]
+    async fn stale_hour_rolls_over_on_read() {
+        let app = router_with_clock(test_users(), None, || H + 1);
+        let response = app
+            .oneshot(
+                Request::get("/api/users/alice")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_json(response).await;
+        assert_eq!(json["used"], "200B");
+        assert_eq!(json["hour_used"], "0B");
+    }
+
+    #[test]
+    fn token_comparison() {
+        assert!(token_matches("secret", "secret"));
+        assert!(!token_matches("secreT", "secret"));
+        assert!(!token_matches("secret1", "secret"));
+        assert!(!token_matches("", "secret"));
     }
 
     #[tokio::test]

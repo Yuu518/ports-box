@@ -25,15 +25,18 @@ RUN case "$TARGETPLATFORM" in \
 
 FROM debian:bookworm-slim AS runtime
 
+COPY --from=builder /app/ports-box /usr/local/bin/ports-box
+
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates libcap2-bin \
+    && setcap cap_net_bind_service=+ep /usr/local/bin/ports-box \
+    && apt-get purge -y --auto-remove libcap2-bin \
     && rm -rf /var/lib/apt/lists/* \
-    && groupadd --system ports-box \
-    && useradd --system --gid ports-box --home-dir /var/lib/ports-box ports-box \
+    && groupadd --system --gid 10001 ports-box \
+    && useradd --system --uid 10001 --gid ports-box --home-dir /var/lib/ports-box ports-box \
     && mkdir -p /etc/ports-box /var/lib/ports-box \
     && chown -R ports-box:ports-box /var/lib/ports-box
 
-COPY --from=builder /app/ports-box /usr/local/bin/ports-box
 COPY config.example.json /etc/ports-box/config.example.json
 
 USER ports-box

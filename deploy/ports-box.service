@@ -9,6 +9,7 @@ WorkingDirectory=/opt/forwarder
 ExecStart=/opt/forwarder/ports-box -d /opt/forwarder -c config.json
 Restart=on-failure
 RestartSec=3
+LimitNOFILE=1048576
 
 # SIGTERM triggers a final usage flush to state.db before exit
 KillSignal=SIGTERM
