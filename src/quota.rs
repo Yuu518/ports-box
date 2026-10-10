@@ -59,6 +59,8 @@ pub struct SavedUsage {
     pub hour_id: i64,
 }
 
+const NO_LIMIT: u64 = u64::MAX;
+
 /// Per-user traffic quota, shared by every rule of that user.
 ///
 /// Billing follows the carrier model: each local wall-clock hour is one
@@ -71,8 +73,8 @@ pub struct SavedUsage {
 /// out.
 pub struct UserQuota {
     pub name: String,
-    /// `None` means unlimited: usage is still tracked, never enforced.
-    pub limit: Option<u64>,
+    /// `NO_LIMIT` means unlimited: usage is still tracked, never enforced.
+    limit: AtomicU64,
     /// Lifetime totals, reported raw by the /sub endpoint.
     total_upload: AtomicU64,
     total_download: AtomicU64,
@@ -114,7 +116,7 @@ impl UserQuota {
         let (exhausted, _) = watch::channel(limit.is_some_and(|l| used >= l));
         Self {
             name,
-            limit,
+            limit: AtomicU64::new(limit.unwrap_or(NO_LIMIT)),
             total_upload: AtomicU64::new(saved.upload),
             total_download: AtomicU64::new(saved.download),
             settled: AtomicU64::new(settled),
@@ -145,7 +147,7 @@ impl UserQuota {
         };
         total.fetch_add(n, Ordering::Relaxed);
         bucket.fetch_add(n, Ordering::Relaxed);
-        if let Some(limit) = self.limit
+        if let Some(limit) = self.limit()
             && self.used() >= limit
         {
             self.exhausted.send_replace(true);
@@ -177,6 +179,21 @@ impl UserQuota {
         self.settled.fetch_add(up.max(down), Ordering::Release);
         self.bucket_hour.store(now_hour, Ordering::Relaxed);
         clock::refresh_offset();
+    }
+
+    pub fn limit(&self) -> Option<u64> {
+        Some(self.limit.load(Ordering::Relaxed)).filter(|&l| l != NO_LIMIT)
+    }
+
+    pub fn set_limit(&self, limit: Option<u64>) {
+        self.limit
+            .store(limit.unwrap_or(NO_LIMIT), Ordering::Relaxed);
+        let exhausted = limit.is_some_and(|l| self.used() >= l);
+        self.exhausted.send_if_modified(|current| {
+            let changed = *current != exhausted;
+            *current = exhausted;
+            changed
+        });
     }
 
     pub fn is_exhausted(&self) -> bool {
@@ -214,7 +231,7 @@ impl UserQuota {
 
     /// Remaining bytes before the limit; `None` when unlimited.
     pub fn remaining(&self) -> Option<u64> {
-        self.limit.map(|l| l.saturating_sub(self.used()))
+        self.limit().map(|l| l.saturating_sub(self.used()))
     }
 
     /// Consistent snapshot for persistence. Holding `settle_lock` keeps a
@@ -398,6 +415,28 @@ mod tests {
         assert_eq!(quota.used(), 100); // identical value, now fully settled
         assert_eq!(quota.hour_used(), 0);
         assert_eq!(quota.snapshot().hour_id, H);
+    }
+
+    #[test]
+    fn set_limit_lifts_and_imposes_exhaustion() {
+        let quota = quota(Some(100));
+        assert!(!quota.try_consume_at(100, Direction::Upload, H));
+        assert!(quota.is_exhausted());
+
+        quota.set_limit(Some(150));
+        assert!(!quota.is_exhausted());
+        assert_eq!(quota.limit(), Some(150));
+        assert!(quota.try_consume_at(10, Direction::Upload, H));
+        assert_eq!(quota.remaining(), Some(40));
+
+        quota.set_limit(Some(50));
+        assert!(quota.is_exhausted());
+
+        quota.set_limit(None);
+        assert!(!quota.is_exhausted());
+        assert_eq!(quota.limit(), None);
+        assert_eq!(quota.remaining(), None);
+        assert!(quota.try_consume_at(1 << 30, Direction::Download, H));
     }
 
     #[tokio::test]

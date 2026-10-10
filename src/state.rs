@@ -8,6 +8,7 @@ use tokio::sync::watch;
 use tracing::{error, info};
 
 use crate::quota::{SavedUsage, UserQuota, clock};
+use crate::runtime::UserSet;
 
 /// SQLite-backed persistence for per-user usage counters.
 ///
@@ -192,7 +193,7 @@ fn migrate(conn: &mut Connection) -> Result<(), String> {
 /// each flush runs in `spawn_blocking` to keep it off the async workers.
 pub async fn run_flush_task(
     db: Arc<StateDb>,
-    users: Arc<Vec<Arc<UserQuota>>>,
+    users: watch::Receiver<Arc<UserSet>>,
     interval: Duration,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -210,9 +211,9 @@ pub async fn run_flush_task(
             _ = shutdown.wait_for(|&s| s) => (true, true),
         };
         let db = db.clone();
-        let users = users.clone();
+        let users = users.borrow().clone();
         let result = tokio::task::spawn_blocking(move || {
-            db.flush(&users)?;
+            db.flush(users.as_slice())?;
             if checkpoint {
                 db.checkpoint()?;
             }

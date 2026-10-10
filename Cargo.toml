@@ -6,7 +6,7 @@ description = "Port forwarder with per-user traffic quotas"
 license = "MIT"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "signal", "sync", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "signal", "sync", "macros", "fs"] }
 serde = { version = "1", features = ["derive"] }
 json5 = "0.4"
 serde_yaml_ng = "0.10"

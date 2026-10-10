@@ -13,6 +13,7 @@ use tracing::{debug, warn};
 
 use crate::pool::{CONNECT_TIMEOUT, TargetPool};
 use crate::quota::{Direction, UserQuota, exhausted};
+use crate::runtime::stopped;
 
 const RECV_BUF: usize = 64 * 1024;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -36,12 +37,13 @@ enum Slot {
 }
 
 struct Relay {
-    socket: UdpSocket,
+    socket: Arc<UdpSocket>,
     sessions: Mutex<HashMap<SocketAddr, Slot>>,
     epoch: Instant,
     pool: Arc<TargetPool>,
     quota: Arc<UserQuota>,
     max_sessions: usize,
+    stop: watch::Receiver<()>,
 }
 
 impl Relay {
@@ -75,16 +77,24 @@ impl Relay {
     }
 }
 
-pub async fn serve(socket: UdpSocket, pool: Arc<TargetPool>, quota: Arc<UserQuota>) {
-    serve_with_limit(socket, pool, quota, MAX_SESSIONS).await
+pub async fn serve(
+    socket: Arc<UdpSocket>,
+    pool: Arc<TargetPool>,
+    quota: Arc<UserQuota>,
+    stop: watch::Receiver<()>,
+) {
+    serve_with_limit(socket, pool, quota, stop, MAX_SESSIONS).await
 }
 
 async fn serve_with_limit(
-    socket: UdpSocket,
+    socket: Arc<UdpSocket>,
     pool: Arc<TargetPool>,
     quota: Arc<UserQuota>,
+    stop: watch::Receiver<()>,
     max_sessions: usize,
 ) {
+    let shutdown = stopped(stop.clone());
+    tokio::pin!(shutdown);
     let relay = Arc::new(Relay {
         socket,
         sessions: Mutex::default(),
@@ -92,11 +102,17 @@ async fn serve_with_limit(
         pool,
         quota,
         max_sessions,
+        stop,
     });
     let mut buf = vec![0u8; RECV_BUF];
 
     loop {
-        let (n, peer) = match relay.socket.recv_from(&mut buf).await {
+        let received = tokio::select! {
+            biased;
+            _ = &mut shutdown => return,
+            received = relay.socket.recv_from(&mut buf) => received,
+        };
+        let (n, peer) = match received {
             Ok(r) => r,
             Err(e) => {
                 warn!(user = %relay.quota.name, "udp recv failed: {e}");
@@ -232,6 +248,7 @@ async fn relay_downstream(relay: Arc<Relay>, session: Arc<Session>, peer: Socket
         let received = tokio::select! {
             r = timeout(IDLE_TIMEOUT, session.upstream.recv(&mut buf)) => r,
             _ = exhausted(quota.subscribe()) => break,
+            _ = stopped(relay.stop.clone()) => break,
             _ = active_moved(&mut active_rx, session.target_index) => {
                 debug!(user = %quota.name, %peer, "udp session ended: active target changed");
                 break;
@@ -287,6 +304,7 @@ async fn active_moved(rx: &mut watch::Receiver<usize>, index: usize) {
 mod tests {
     use super::*;
     use crate::quota::SavedUsage;
+    use crate::runtime::never_stop;
 
     async fn tagged_echo(tag: &'static [u8]) -> String {
         limited_echo(tag, usize::MAX).await
@@ -316,7 +334,13 @@ mod tests {
     ) -> SocketAddr {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = socket.local_addr().unwrap();
-        tokio::spawn(serve_with_limit(socket, pool, quota, max_sessions));
+        tokio::spawn(serve_with_limit(
+            Arc::new(socket),
+            pool,
+            quota,
+            never_stop(),
+            max_sessions,
+        ));
         addr
     }
 

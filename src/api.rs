@@ -7,15 +7,15 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Serialize;
+use tokio::sync::watch;
 
 use crate::config::format_size;
 use crate::quota::{UserQuota, clock};
+use crate::runtime::UserSet;
 
 #[derive(Clone)]
 pub struct ApiState {
-    users: Arc<HashMap<String, Arc<UserQuota>>>,
-    /// Kept in insertion (config) order for stable /api/users output.
-    ordered: Arc<Vec<Arc<UserQuota>>>,
+    users: watch::Receiver<Arc<UserSet>>,
     token: Option<Arc<str>>,
     now_hour: fn() -> i64,
 }
@@ -34,7 +34,7 @@ impl UserUsage {
         q.roll_over_at(now_hour);
         Self {
             name: q.name.clone(),
-            total: q.limit.map_or_else(|| "unlimited".into(), format_size),
+            total: q.limit().map_or_else(|| "unlimited".into(), format_size),
             used: format_size(q.used()),
             hour_used: format_size(q.hour_used()),
             remaining: q
@@ -66,18 +66,17 @@ fn token_matches(given: &str, expected: &str) -> bool {
         ) == 0
 }
 
-pub fn router(users: Arc<Vec<Arc<UserQuota>>>, token: Option<String>) -> Router {
+pub fn router(users: watch::Receiver<Arc<UserSet>>, token: Option<String>) -> Router {
     router_with_clock(users, token, clock::current_hour_id)
 }
 
 fn router_with_clock(
-    users: Arc<Vec<Arc<UserQuota>>>,
+    users: watch::Receiver<Arc<UserSet>>,
     token: Option<String>,
     now_hour: fn() -> i64,
 ) -> Router {
     let state = ApiState {
-        users: Arc::new(users.iter().map(|u| (u.name.clone(), u.clone())).collect()),
-        ordered: users,
+        users,
         token: token.map(Into::into),
         now_hour,
     };
@@ -117,11 +116,8 @@ async fn list_users(
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let now_hour = (state.now_hour)();
-    let usage: Vec<UserUsage> = state
-        .ordered
-        .iter()
-        .map(|u| UserUsage::new(u, now_hour))
-        .collect();
+    let users = state.users.borrow().clone();
+    let usage: Vec<UserUsage> = users.iter().map(|u| UserUsage::new(u, now_hour)).collect();
     Json(usage).into_response()
 }
 
@@ -134,8 +130,9 @@ async fn get_user(
     if !authorize(&state, &headers, &query) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    match state.users.get(&name) {
-        Some(user) => Json(UserUsage::new(user, (state.now_hour)())).into_response(),
+    let user = state.users.borrow().get(&name).cloned();
+    match user {
+        Some(user) => Json(UserUsage::new(&user, (state.now_hour)())).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -151,14 +148,14 @@ async fn sub_store(
     if !authorize(&state, &headers, &query) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let Some(user) = state.users.get(&name) else {
+    let Some(user) = state.users.borrow().get(&name).cloned() else {
         return StatusCode::NOT_FOUND.into_response();
     };
     user.roll_over_at((state.now_hour)());
-    let (upload, download) = billed_split(user);
+    let (upload, download) = billed_split(&user);
     // Unlimited users omit `total=`, which Sub-Store reads as no cap.
     let mut userinfo = format!("upload={upload}; download={download}");
-    if let Some(limit) = user.limit {
+    if let Some(limit) = user.limit() {
         userinfo.push_str(&format!("; total={limit}"));
     }
     (
@@ -186,7 +183,7 @@ mod tests {
         router_with_clock(test_users(), token, || H)
     }
 
-    fn test_users() -> Arc<Vec<Arc<UserQuota>>> {
+    fn test_users() -> watch::Receiver<Arc<UserSet>> {
         let alice = Arc::new(UserQuota::new_at(
             "alice".into(),
             Some(1000),
@@ -202,7 +199,7 @@ mod tests {
             H,
         ));
         bob.try_consume_at(50, Direction::Upload, H);
-        Arc::new(vec![alice, bob])
+        watch::channel(Arc::new(UserSet::new(vec![alice, bob]))).1
     }
 
     async fn body_json(response: Response) -> serde_json::Value {

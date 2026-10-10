@@ -24,7 +24,7 @@ pub struct Config {
 
 /// Optional usage persistence. Omitting the whole section keeps counters
 /// in memory only, so they reset on restart.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StateFileConfig {
     #[serde(default = "default_true")]
@@ -35,7 +35,7 @@ pub struct StateFileConfig {
     pub flush_secs: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApiConfig {
     pub listen: SocketAddr,
@@ -104,7 +104,7 @@ fn string_or_strings<'de, D: serde::Deserializer<'de>>(
     deserializer.deserialize_any(Visitor)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Protocol {
     #[default]
@@ -231,17 +231,15 @@ pub fn format_size(bytes: u64) -> String {
     format!("{value:.2}{}", UNITS[unit])
 }
 
-pub fn load(path: &Path) -> Result<Config, String> {
-    let raw = std::fs::read_to_string(path)
-        .map_err(|e| format!("cannot read config {}: {e}", path.display()))?;
+pub fn parse(raw: &str, path: &Path) -> Result<Config, String> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     let config: Config = if ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml") {
-        serde_yaml_ng::from_str(&raw)
+        serde_yaml_ng::from_str(raw)
             .map_err(|e| format!("invalid config {}: {e}", path.display()))?
     } else {
         // JSON5: a JSON superset with comments, trailing commas, unquoted
         // keys, and single-quoted strings.
-        json5::from_str(&raw).map_err(|e| format!("invalid config {}: {e}", path.display()))?
+        json5::from_str(raw).map_err(|e| format!("invalid config {}: {e}", path.display()))?
     };
     finalize(config)
 }
@@ -343,6 +341,10 @@ pub fn resolve_quotas(config: &Config) -> HashMap<String, Option<u64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn load(path: &Path) -> Result<Config, String> {
+        parse(&std::fs::read_to_string(path).unwrap(), path)
+    }
 
     fn parse_config(json: &str) -> Result<Config, String> {
         let config: Config = json5::from_str(json).map_err(|e| e.to_string())?;

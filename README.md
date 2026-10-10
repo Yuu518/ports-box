@@ -6,8 +6,9 @@ A TCP/UDP port forwarder for Linux with per-user traffic quotas.
 - **Failover (fallback)**: each rule can have multiple backup targets — when the primary target is unavailable it automatically switches by priority and switches back once the primary recovers; rules that include TCP detect recovery via background health checks (every 10 seconds by default)
 - **Domain name resolution**: forwarding targets can be domain names, resolved using the host's DNS configuration (`/etc/resolv.conf`, `/etc/hosts`) and cached according to record TTL — after a domain's records change, new connections automatically use the new address without a restart
 - **Traffic quotas (optional)**: quotas can be set per user, or a single `total_quota` can be split evenly among users without an individual quota; if neither is set, that user is **unlimited** (usage is recorded but not enforced); usage follows the carrier billing model — each **local wall-clock hour** is a billing period charged as the **larger of inbound and outbound** in that hour (`max(upload, download)`), and billed usage is the sum over hours
-- **Hard stop on quota exhaustion**: new connections are rejected, in-flight connections are closed immediately, UDP packets are dropped; service resumes after raising the quota and restarting
+- **Hard stop on quota exhaustion**: new connections are rejected, in-flight connections are closed immediately, UDP packets are dropped; service resumes as soon as the quota is raised in the config (no restart needed)
 - **Usage persistence (optional)**: with `state_file` configured, used traffic is stored in a SQLite database (flushed every 10 seconds by default and on exit), so counters survive restarts; without it, usage is kept in memory only and resets to zero on restart
+- **Config auto-reload**: edits to the config file are picked up automatically without a restart; an invalid config is rejected and the running one is kept (see "Config auto-reload" below)
 - **Query API**: an HTTP interface returns each user's total/used/remaining traffic; compatible with Sub-Store (`subscription-userinfo` response header)
 
 ## Build and run
@@ -21,6 +22,7 @@ cargo build --release
 |---|---|
 | `-c, --config <FILE>` | Path to the config file, defaults to `./config.json`; parsed as YAML when the extension is `.yaml`/`.yml`, otherwise as JSON |
 | `-d, --dir <DIR>` | Working directory, changed into at startup (relative paths in the config such as `state_file.path` are resolved against it) |
+| `--no-reload` | Do not watch the config file; changes then take effect only after a restart |
 
 The log level is controlled via `RUST_LOG` (default `ports_box=info`). On SIGTERM / SIGINT, usage is written to the database before exiting.
 
@@ -220,7 +222,21 @@ Results are cached according to the DNS record's **TTL**: repeated lookups withi
 **new** connections/sessions use the new address once the old TTL expires, no restart needed; established connections are unaffected and finish naturally.
 IP literals (including IPv6 in the `[::1]:80` form) bypass DNS. Invalid domain names or ports are reported as errors at startup.
 
-Quota changes (including adding traffic) take effect **after a restart**; with `state_file` enabled, used traffic is restored from the database, so restarting does not reset the counters.
+Quota changes (including adding traffic) take effect as soon as the config file is saved (see "Config auto-reload"); used traffic is kept. With `state_file` enabled, used traffic is also restored from the database after a restart, so restarting does not reset the counters.
+
+## Config auto-reload
+
+The config file is checked every 3 seconds; when its content changes (and stays the same for another 0.5 seconds, so a half-written file is never picked up), it is reloaded without a restart:
+
+- The new config is fully parsed and validated, and every newly needed port is bound, **before** anything changes. If any step fails (syntax error, invalid field, duplicate listen address, port already in use, …), the reload is rejected with an `ERROR` log line and the running config stays in effect. Fixing the file triggers the next reload automatically.
+- Unchanged rules keep running untouched, including their established connections.
+- Removed or disabled rules stop listening, and their TCP connections and UDP sessions are closed.
+- A changed rule (different `target`, `fallback`, `protocol`, `check_secs`, or owner) is restarted: its existing connections are closed and new ones use the new settings. The listening socket is handed over, not rebound, so the port never goes away.
+- Quota changes (`quota`, `total_quota`) apply immediately and keep used traffic: raising a quota re-enables an exhausted user, lowering it below the used amount stops that user's traffic at once.
+- New users start from the usage stored in `state_file` (if any); removed users have their usage flushed to it first.
+- Changes to `api` and `state_file` are not applied live; a warning is logged and they take effect after a restart.
+
+With Docker, a single-file bind mount (`./config.json:/etc/ports-box/config.json`) only sees edits that overwrite the file in place (e.g. `cp new.json config.json`); editors that save by writing a new file and renaming it replace the host file, which the container no longer sees. Mount the directory instead if you edit the config that way. Pass `--no-reload` to turn auto-reload off.
 
 ## Query API
 
@@ -275,7 +291,7 @@ systemctl status ports-box      # check status
 journalctl -u ports-box -f      # follow logs
 ```
 
-After changing the config (e.g. adjusting quotas), apply it with `systemctl restart ports-box`;
+Config changes (rules, quotas) are applied automatically, see "Config auto-reload"; changes to `api` / `state_file` need `systemctl restart ports-box`;
 stopping/restarting writes usage to `state.db` first, so no counters are lost.
 
 ---

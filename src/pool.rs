@@ -7,6 +7,8 @@ use tokio::task::JoinSet;
 use tokio::time::{MissedTickBehavior, timeout};
 use tracing::{info, warn};
 
+use crate::runtime::stopped;
+
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_CONCURRENCY: usize = 16;
 
@@ -157,13 +159,20 @@ impl TargetPool {
 /// interval elapses, TCP-connects to the targets its traffic cannot vouch
 /// for — downed ones (so the active target recovers) and idle ones (so a
 /// dead target is noticed even with nothing flowing).
-pub async fn probe_task(pools: Vec<(Arc<TargetPool>, Duration)>) {
-    let permits = Arc::new(Semaphore::new(PROBE_CONCURRENCY));
-    let mut tasks = JoinSet::new();
-    for (pool, interval) in pools {
-        tasks.spawn(probe_pool(pool, interval, permits.clone()));
+pub fn probe_permits() -> Arc<Semaphore> {
+    Arc::new(Semaphore::new(PROBE_CONCURRENCY))
+}
+
+pub async fn probe(
+    pool: Arc<TargetPool>,
+    interval: Duration,
+    permits: Arc<Semaphore>,
+    stop: watch::Receiver<()>,
+) {
+    tokio::select! {
+        _ = stopped(stop) => {}
+        _ = probe_pool(pool, interval, permits) => {}
     }
-    while tasks.join_next().await.is_some() {}
 }
 
 async fn probe_pool(pool: Arc<TargetPool>, interval: Duration, permits: Arc<Semaphore>) {
@@ -195,6 +204,7 @@ async fn probe_pool(pool: Arc<TargetPool>, interval: Duration, permits: Arc<Sema
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::never_stop;
 
     fn pool(cooldown: Option<Duration>) -> Arc<TargetPool> {
         TargetPool::new(
@@ -276,7 +286,12 @@ mod tests {
         pool.mark_down(0);
         assert_eq!(pool.pick().0, 1);
 
-        let probe = tokio::spawn(probe_task(vec![(pool.clone(), Duration::from_millis(50))]));
+        let probe = tokio::spawn(probe(
+            pool.clone(),
+            Duration::from_millis(50),
+            probe_permits(),
+            never_stop(),
+        ));
         timeout(Duration::from_secs(5), async {
             while pool.pick().0 != 0 {
                 rx.changed().await.unwrap();
@@ -294,7 +309,12 @@ mod tests {
         // No traffic ever confirms this dead target, so the prober is the
         // only thing that can notice it.
         let pool = TargetPool::new("a".into(), vec!["127.0.0.1:1".into()], None);
-        let probe = tokio::spawn(probe_task(vec![(pool.clone(), Duration::from_millis(50))]));
+        let probe = tokio::spawn(probe(
+            pool.clone(),
+            Duration::from_millis(50),
+            probe_permits(),
+            never_stop(),
+        ));
         timeout(Duration::from_secs(5), async {
             while pool.is_healthy(0) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -310,7 +330,12 @@ mod tests {
         // The target is unreachable, but traffic keeps confirming it, so
         // the prober must leave it alone.
         let pool = TargetPool::new("a".into(), vec!["127.0.0.1:1".into()], None);
-        let probe = tokio::spawn(probe_task(vec![(pool.clone(), Duration::from_millis(100))]));
+        let probe = tokio::spawn(probe(
+            pool.clone(),
+            Duration::from_millis(100),
+            probe_permits(),
+            never_stop(),
+        ));
         for _ in 0..15 {
             pool.confirm(0);
             tokio::time::sleep(Duration::from_millis(20)).await;

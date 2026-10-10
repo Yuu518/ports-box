@@ -3,23 +3,23 @@ mod config;
 mod dns;
 mod pool;
 mod quota;
+mod runtime;
 mod state;
 mod tcp;
 mod udp;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::watch;
+use tokio::net::TcpListener;
+use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
-use crate::config::format_size;
-use crate::pool::TargetPool;
-use crate::quota::UserQuota;
+use crate::config::Config;
+use crate::runtime::Runtime;
 use crate::state::StateDb;
 
 #[derive(Parser)]
@@ -32,6 +32,9 @@ struct Args {
     /// Working directory to chdir into before loading anything
     #[arg(short, long)]
     dir: Option<PathBuf>,
+
+    #[arg(long, help = "Do not watch the config file and reload it on change")]
+    no_reload: bool,
 }
 
 fn main() -> ExitCode {
@@ -112,8 +115,9 @@ fn raise_nofile_limit() {}
 
 async fn run(args: Args) -> Result<(), String> {
     raise_nofile_limit();
-    let config = config::load(&args.config)?;
-    let quotas = config::resolve_quotas(&config);
+    let raw = std::fs::read_to_string(&args.config)
+        .map_err(|e| format!("cannot read config {}: {e}", args.config.display()))?;
+    let config = config::parse(&raw, &args.config)?;
 
     let db = match &config.state_file {
         Some(state) if state.enabled => Some((
@@ -122,89 +126,14 @@ async fn run(args: Args) -> Result<(), String> {
         )),
         _ => None,
     };
-    let saved = match &db {
-        Some((db, _)) => db.load()?,
-        None => {
-            info!("state persistence disabled; usage resets on restart");
-            Default::default()
-        }
-    };
-
-    let mut users: Vec<Arc<UserQuota>> = Vec::new();
-    for user in &config.users {
-        let limit = quotas[&user.name];
-        let usage = saved.get(&user.name).copied().unwrap_or_default();
-        let quota = Arc::new(UserQuota::new(user.name.clone(), limit, usage));
-        match limit {
-            None => info!(
-                user = %user.name,
-                "quota unlimited ({} used)",
-                format_size(quota.used()),
-            ),
-            Some(limit) if quota.is_exhausted() => warn!(
-                user = %user.name,
-                "quota already exhausted ({} used of {})",
-                format_size(quota.used()),
-                format_size(limit),
-            ),
-            Some(limit) => info!(
-                user = %user.name,
-                "quota {} ({} used, {} remaining)",
-                format_size(limit),
-                format_size(quota.used()),
-                format_size(quota.remaining().unwrap_or(0)),
-            ),
-        }
-        users.push(quota);
+    if db.is_none() {
+        info!("state persistence disabled; usage resets on restart");
     }
-    let users = Arc::new(users);
 
     // Bind everything up front so a bad config fails fast, before any
     // forwarding starts.
-    let mut probes: Vec<(Arc<TargetPool>, Duration)> = Vec::new();
-    for (user, quota) in config.users.iter().zip(users.iter()) {
-        for rule in &user.rules {
-            if !rule.enabled {
-                info!(user = %user.name, listen = %rule.listen, "rule disabled, skipping");
-                continue;
-            }
-            let mut targets = vec![rule.target.clone()];
-            targets.extend(rule.fallback.iter().cloned());
-            let check_interval = Duration::from_secs(rule.check_secs);
-            // UDP-only targets cannot be probed over TCP; they recover via
-            // a retry cooldown instead of the probe task.
-            let cooldown =
-                (!rule.fallback.is_empty() && !rule.protocol.tcp()).then_some(check_interval);
-            let pool = TargetPool::new(user.name.clone(), targets, cooldown);
-            if !rule.fallback.is_empty() && rule.protocol.tcp() {
-                probes.push((pool.clone(), check_interval));
-            }
-            if rule.protocol.tcp() {
-                let listener = TcpListener::bind(rule.listen)
-                    .await
-                    .map_err(|e| format!("cannot bind tcp {}: {e}", rule.listen))?;
-                tokio::spawn(tcp::serve(listener, pool.clone(), quota.clone()));
-            }
-            if rule.protocol.udp() {
-                let socket = UdpSocket::bind(rule.listen)
-                    .await
-                    .map_err(|e| format!("cannot bind udp {}: {e}", rule.listen))?;
-                tokio::spawn(udp::serve(socket, pool.clone(), quota.clone()));
-            }
-            if rule.fallback.is_empty() {
-                info!(user = %user.name, "{} {} -> {}", rule.protocol, rule.listen, rule.target);
-            } else {
-                info!(
-                    user = %user.name,
-                    "{} {} -> {} (fallback: {})",
-                    rule.protocol, rule.listen, rule.target, rule.fallback.join(", "),
-                );
-            }
-        }
-    }
-    if !probes.is_empty() {
-        tokio::spawn(pool::probe_task(probes));
-    }
+    let mut runtime = Runtime::new(db.as_ref().map(|(db, _)| db.clone()));
+    runtime.apply(&config).await?;
 
     if let Some(api) = &config.api {
         let listener = TcpListener::bind(api.listen)
@@ -217,7 +146,7 @@ async fn run(args: Args) -> Result<(), String> {
                 api.listen
             );
         }
-        let router = api::router(users.clone(), api.token.clone());
+        let router = api::router(runtime.users(), api.token.clone());
         tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, router).await {
                 error!("api server failed: {e}");
@@ -225,27 +154,71 @@ async fn run(args: Args) -> Result<(), String> {
         });
     }
 
-    let Some((db, flush_interval)) = db else {
-        wait_for_shutdown().await;
+    let flusher = db.map(|(db, flush_interval)| {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(state::run_flush_task(
+            db,
+            runtime.users(),
+            flush_interval,
+            shutdown_rx,
+        ));
+        (shutdown_tx, task)
+    });
+
+    let (reload_tx, mut reload_rx) = mpsc::channel(1);
+    if args.no_reload {
+        info!("config auto-reload disabled");
+    } else {
+        tokio::spawn(runtime::watch_config(
+            args.config.clone(),
+            raw,
+            runtime::RELOAD_POLL,
+            reload_tx,
+        ));
+    }
+
+    let shutdown = wait_for_shutdown();
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => break,
+            Some(raw) = reload_rx.recv() => {
+                reload(&mut runtime, &config, &args.config, &raw).await;
+            }
+        }
+    }
+
+    let Some((shutdown_tx, flusher)) = flusher else {
         info!("shutting down");
         return Ok(());
     };
-
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let flusher = tokio::spawn(state::run_flush_task(
-        db,
-        users,
-        flush_interval,
-        shutdown_rx,
-    ));
-
-    wait_for_shutdown().await;
     info!("shutting down, flushing state");
     let _ = shutdown_tx.send(true);
     if let Err(e) = flusher.await {
         error!("flush task failed on shutdown: {e}");
     }
     Ok(())
+}
+
+async fn reload(runtime: &mut Runtime, initial: &Config, path: &Path, raw: &str) {
+    info!("config file changed, reloading");
+    let next = match config::parse(raw, path) {
+        Ok(next) => next,
+        Err(e) => {
+            error!("config reload rejected, keeping current config: {e}");
+            return;
+        }
+    };
+    if let Err(e) = runtime.apply(&next).await {
+        error!("config reload rejected, keeping current config: {e}");
+        return;
+    }
+    if next.api != initial.api {
+        warn!("api settings changed; restart to apply them");
+    }
+    if next.state_file != initial.state_file {
+        warn!("state_file settings changed; restart to apply them");
+    }
 }
 
 #[cfg(unix)]

@@ -5,11 +5,13 @@ use std::time::Duration;
 use socket2::{SockRef, TcpKeepalive};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::pool::{CONNECT_TIMEOUT, TargetPool};
 use crate::quota::{Direction, UserQuota, exhausted};
+use crate::runtime::stopped;
 
 const COPY_BUF: usize = 64 * 1024;
 const ACCEPT_BACKOFF: Duration = Duration::from_secs(1);
@@ -26,9 +28,21 @@ fn set_keepalive(stream: &TcpStream) {
     let _ = SockRef::from(stream).set_tcp_keepalive(&ka);
 }
 
-pub async fn serve(listener: TcpListener, pool: Arc<TargetPool>, quota: Arc<UserQuota>) {
+pub async fn serve(
+    listener: Arc<TcpListener>,
+    pool: Arc<TargetPool>,
+    quota: Arc<UserQuota>,
+    stop: watch::Receiver<()>,
+) {
+    let shutdown = stopped(stop.clone());
+    tokio::pin!(shutdown);
     loop {
-        let (client, peer) = match listener.accept().await {
+        let accepted = tokio::select! {
+            biased;
+            _ = &mut shutdown => return,
+            accepted = listener.accept() => accepted,
+        };
+        let (client, peer) = match accepted {
             Ok(conn) => conn,
             Err(e) if is_connection_error(&e) => {
                 debug!(user = %quota.name, "tcp accept failed: {e}");
@@ -46,8 +60,9 @@ pub async fn serve(listener: TcpListener, pool: Arc<TargetPool>, quota: Arc<User
         }
         let pool = pool.clone();
         let quota = quota.clone();
+        let stop = stop.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(client, &pool, &quota).await {
+            if let Err(e) = handle(client, &pool, &quota, stop).await {
                 debug!(user = %quota.name, %peer, "tcp connection closed: {e}");
             }
         });
@@ -96,8 +111,16 @@ async fn connect_active(pool: &Arc<TargetPool>) -> io::Result<TcpStream> {
     Err(last_err.unwrap_or_else(|| io::Error::other("no targets")))
 }
 
-async fn handle(client: TcpStream, pool: &Arc<TargetPool>, quota: &UserQuota) -> io::Result<()> {
-    let upstream = connect_active(pool).await?;
+async fn handle(
+    client: TcpStream,
+    pool: &Arc<TargetPool>,
+    quota: &UserQuota,
+    stop: watch::Receiver<()>,
+) -> io::Result<()> {
+    let upstream = tokio::select! {
+        upstream = connect_active(pool) => upstream?,
+        _ = stopped(stop.clone()) => return Ok(()),
+    };
     let _ = client.set_nodelay(true);
     let _ = upstream.set_nodelay(true);
     set_keepalive(&client);
@@ -116,6 +139,10 @@ async fn handle(client: TcpStream, pool: &Arc<TargetPool>, quota: &UserQuota) ->
         // Kill in-flight connections the moment the quota runs out.
         _ = exhausted(quota.subscribe()) => {
             info!(user = %quota.name, "quota exhausted, dropping tcp connection");
+            Ok(())
+        }
+        _ = stopped(stop) => {
+            debug!(user = %quota.name, "rule removed, dropping tcp connection");
             Ok(())
         }
     }
@@ -150,6 +177,7 @@ where
 mod tests {
     use super::*;
     use crate::quota::SavedUsage;
+    use crate::runtime::never_stop;
 
     async fn echo_server() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -170,7 +198,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let pool = TargetPool::new("a".into(), targets, None);
-        tokio::spawn(serve(listener, pool, quota));
+        tokio::spawn(serve(Arc::new(listener), pool, quota, never_stop()));
         addr
     }
 
