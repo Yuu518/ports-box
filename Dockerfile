@@ -42,7 +42,7 @@ COPY config.example.json /etc/ports-box/config.example.json
 USER ports-box
 WORKDIR /var/lib/ports-box
 
-EXPOSE 7070
+EXPOSE 7070 8888
 
 ENTRYPOINT ["ports-box"]
 CMD ["-c", "/etc/ports-box/config.json", "-d", "/var/lib/ports-box"]

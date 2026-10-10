@@ -1,0 +1,596 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>ports-box</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --ground: #eef1f4;
+  --surface: #ffffff;
+  --sunk: #e3e8ed;
+  --ink: #16202b;
+  --muted: #5b6b7a;
+  --line: #cdd5dd;
+  --live: #0e7c7b;
+  --warn: #b86a00;
+  --down: #c2362f;
+  --focus: #2f6fde;
+  --sans: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  --mono: "Cascadia Mono", "SF Mono", ui-monospace, Consolas, "Liberation Mono", monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ground: #0f1722;
+    --surface: #172230;
+    --sunk: #1f2c3c;
+    --ink: #dce4ec;
+    --muted: #8fa0b2;
+    --line: #2c3b4d;
+    --live: #3fc1b6;
+    --warn: #e6a23c;
+    --down: #f0736b;
+    --focus: #7aa7ff;
+  }
+}
+* { box-sizing: border-box; }
+html { background: var(--ground); }
+body {
+  margin: 0;
+  font: 15px/1.5 var(--sans);
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+.mono { font-family: var(--mono); font-size: 0.93em; }
+button, input, select { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+
+.shell { max-width: 68rem; margin: 0 auto; padding: 0 1.25rem 7rem; }
+.top {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 1.5rem;
+  padding: 1.25rem 0 1rem; border-bottom: 1px solid var(--line);
+}
+.brand { font-size: 1.25rem; font-weight: 650; letter-spacing: -0.01em; margin: 0; }
+.tabs { display: flex; gap: 0.25rem; margin-right: auto; }
+.tab {
+  border: 0; background: none; padding: 0.35rem 0.75rem; border-radius: 0.4rem;
+  color: var(--muted); cursor: pointer;
+}
+.tab[aria-current="page"] { background: var(--sunk); color: var(--ink); font-weight: 600; }
+.plain {
+  border: 1px solid var(--line); background: var(--surface); padding: 0.35rem 0.8rem;
+  border-radius: 0.4rem; cursor: pointer;
+}
+.plain:hover { border-color: var(--muted); }
+.primary { border: 1px solid var(--live); background: var(--live); color: var(--surface); font-weight: 600; }
+.primary:disabled, .plain:disabled { opacity: 0.5; cursor: default; }
+.quiet { border: 0; background: none; color: var(--muted); cursor: pointer; padding: 0.25rem 0.4rem; border-radius: 0.3rem; }
+.quiet:hover { color: var(--down); }
+.lost { color: var(--warn); font-size: 0.9rem; }
+
+.user { padding: 1.75rem 0 0.5rem; border-bottom: 1px solid var(--line); }
+.user:last-child { border-bottom: 0; }
+.user-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.25rem 1rem; }
+.user-name { font-size: 1.35rem; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
+.spent { margin-left: auto; color: var(--muted); }
+.spent strong { color: var(--ink); font-weight: 600; }
+.flag { color: var(--down); font-weight: 600; }
+.meter { height: 0.5rem; background: var(--sunk); border-radius: 0.25rem; margin: 0.6rem 0 0.5rem; overflow: hidden; }
+.meter i { display: block; height: 100%; background: var(--live); border-radius: inherit; min-width: 2px; }
+.meter.near i { background: var(--warn); }
+.meter.full i { background: var(--down); }
+.facts { display: flex; flex-wrap: wrap; gap: 0.15rem 1.5rem; margin: 0 0 1rem; color: var(--muted); font-size: 0.9rem; }
+.facts b { color: var(--ink); font-weight: 600; }
+
+.routes { list-style: none; margin: 0; padding: 0; }
+.route {
+  display: grid; align-items: start; gap: 0.25rem 0.9rem;
+  grid-template-columns: 4.6rem 11rem minmax(2.5rem, 1fr) minmax(13rem, 1.6fr) 7rem;
+  overflow-wrap: anywhere;
+  padding: 0.55rem 0; border-top: 1px solid var(--line);
+  --wire: var(--live);
+}
+.route.fallback { --wire: var(--warn); }
+.route.down { --wire: var(--down); }
+.route.off { --wire: var(--line); color: var(--muted); }
+.proto { color: var(--muted); font-size: 0.85rem; padding-top: 0.1rem; }
+.wire { position: relative; height: 1.5rem; }
+.wire::before {
+  content: ""; position: absolute; left: 0; right: 0.4rem; top: 50%;
+  border-top: 2px solid var(--wire);
+}
+.route.off .wire::before { border-top-style: dashed; }
+.wire::after {
+  content: ""; position: absolute; right: 0; top: 50%; translate: 0 -50%;
+  border: 0.32rem solid transparent; border-left-color: var(--wire); border-right-width: 0;
+}
+.targets { list-style: none; margin: 0; padding: 0; }
+.target { display: flex; align-items: baseline; gap: 0.5rem; color: var(--muted); }
+.target .dot {
+  flex: none; width: 0.6rem; height: 0.6rem; border-radius: 50%;
+  border: 2px solid var(--muted); align-self: center;
+}
+.target.active { color: var(--ink); font-weight: 600; }
+.target.active .dot { background: var(--wire); border-color: var(--wire); }
+.target.dead .dot { border-color: var(--down); background: linear-gradient(45deg, transparent 42%, var(--down) 42% 58%, transparent 58%); }
+.target .state { font-size: 0.82rem; font-weight: 400; color: var(--muted); }
+.target.dead .state { color: var(--down); }
+.label { color: var(--muted); font-size: 0.85rem; text-align: right; overflow-wrap: anywhere; }
+.empty { color: var(--muted); padding: 2rem 0; }
+
+.form-row { display: flex; flex-wrap: wrap; align-items: end; gap: 0.75rem 1rem; }
+.field { display: grid; gap: 0.2rem; min-width: 0; }
+.field > span { font-size: 0.82rem; color: var(--muted); }
+.field input, .field select {
+  background: var(--surface); border: 1px solid var(--line); border-radius: 0.35rem;
+  padding: 0.35rem 0.5rem; min-width: 0; width: 100%;
+}
+.field input:hover, .field select:hover { border-color: var(--muted); }
+.hint { color: var(--muted); font-size: 0.88rem; margin: 0.4rem 0 0; max-width: 46rem; }
+.source { margin: 1.25rem 0 0; color: var(--muted); max-width: 46rem; }
+.totals { padding: 1.25rem 0 1.5rem; border-bottom: 1px solid var(--line); }
+.edit-user { padding: 1.5rem 0; border-bottom: 1px solid var(--line); }
+.edit-user .form-row .field { flex: 0 1 14rem; }
+.edit-rule {
+  display: grid; align-items: end; gap: 0.5rem 0.6rem; margin-top: 0.75rem; padding-top: 0.75rem;
+  border-top: 1px dashed var(--line);
+  grid-template-columns: 3.2rem 6.5rem minmax(8rem, 1fr) minmax(8rem, 1.2fr) minmax(8rem, 1.2fr) minmax(4.5rem, 0.6fr) 4.8rem auto;
+}
+.edit-rule .on { display: grid; gap: 0.2rem; justify-items: start; }
+.edit-rule .on span { font-size: 0.82rem; color: var(--muted); }
+.edit-rule .on input { width: 1.1rem; height: 1.1rem; margin: 0.45rem 0; accent-color: var(--live); }
+.adders { display: flex; gap: 0.5rem; margin-top: 1rem; }
+.savebar {
+  position: fixed; left: 0; right: 0; bottom: 0; background: var(--surface);
+  border-top: 1px solid var(--line); padding: 0.75rem 1.25rem;
+}
+.savebar > div { max-width: 68rem; margin: 0 auto; display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.75rem; }
+.savebar p { margin: 0 auto 0 0; min-width: 12rem; flex: 1; overflow-wrap: anywhere; }
+.savebar p.error { color: var(--down); }
+.savebar p.ok { color: var(--live); }
+
+.door { max-width: 22rem; margin: 14vh auto 0; padding: 0 1.25rem; }
+.door h1 { font-size: 1.6rem; font-weight: 650; letter-spacing: -0.015em; margin: 0 0 0.25rem; }
+.door p { color: var(--muted); margin: 0 0 1.5rem; }
+.door form { display: grid; gap: 0.9rem; }
+.door .primary { padding: 0.5rem; border-radius: 0.4rem; cursor: pointer; }
+.door .error { color: var(--down); margin: 0; }
+
+@media (max-width: 52rem) {
+  .route { grid-template-columns: 4.6rem 1fr; }
+  .route .wire { display: none; }
+  .route .targets, .route .label { grid-column: 2; text-align: left; }
+  .spent { margin-left: 0; width: 100%; }
+  .edit-rule { grid-template-columns: 3.2rem 1fr 1fr; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .meter i { transition: width 0.4s ease; }
+}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script>
+"use strict";
+const zh = (navigator.language || "").toLowerCase().startsWith("zh");
+const TEXT = {
+  overview: ["Overview", "概览"],
+  edit: ["Users and rules", "用户与规则"],
+  signOut: ["Sign out", "退出登录"],
+  signIn: ["Sign in", "登录"],
+  signInLead: ["Sign in to manage port forwarding.", "登录后管理端口转发。"],
+  username: ["Username", "用户名"],
+  password: ["Password", "密码"],
+  wrongLogin: ["Wrong username or password.", "用户名或密码错误。"],
+  goneTitle: ["This session has ended", "会话已结束"],
+  goneLead: ["Open the panel again with your token link, for example {0}", "请重新通过带 token 的链接打开面板，例如 {0}"],
+  lost: ["Connection lost, retrying", "连接中断，正在重试"],
+  loading: ["Loading", "加载中"],
+  noUsers: ["No users yet. Add one under Users and rules.", "还没有用户，请在“用户与规则”中添加。"],
+  noRules: ["This user has no rules.", "该用户没有规则。"],
+  usedOf: ["{0} of {1} used", "已用 {0} / {1}"],
+  usedOnly: ["{0} used, no limit", "已用 {0}，不限量"],
+  exhausted: ["Quota used up, traffic stopped", "配额已用尽，流量已停止"],
+  remaining: ["Remaining", "剩余"],
+  thisHour: ["This hour", "本小时"],
+  upload: ["Upload", "上行"],
+  download: ["Download", "下行"],
+  inUse: ["in use", "使用中"],
+  standby: ["standby", "备用"],
+  dead: ["down", "不可用"],
+  off: ["off", "已停用"],
+  totalQuota: ["Total quota", "总配额"],
+  totalHint: ["Users without their own quota split the total evenly. Leave both empty for no limit. Sizes look like 500MB, 30GB or 1.5TB.", "未单独设置配额的用户平分总配额；两者都留空则不限量。大小写法如 500MB、30GB、1.5TB。"],
+  name: ["Name", "名称"],
+  quota: ["Quota", "配额"],
+  quotaPlaceholder: ["share of total", "按总配额平分"],
+  none: ["none", "无"],
+  on: ["On", "启用"],
+  protocol: ["Protocol", "协议"],
+  listen: ["Listen address", "监听地址"],
+  target: ["Target", "目标"],
+  fallback: ["Fallback targets", "备用目标"],
+  fallbackPlaceholder: ["comma separated", "逗号分隔"],
+  tag: ["Tag", "标签"],
+  check: ["Check, s", "检查间隔(秒)"],
+  addRule: ["Add rule", "添加规则"],
+  addUser: ["Add user", "添加用户"],
+  removeRule: ["Remove rule", "删除规则"],
+  removeUser: ["Remove user", "删除用户"],
+  save: ["Save changes", "保存更改"],
+  saving: ["Saving", "保存中"],
+  saved: ["Saved. The new rules are live.", "已保存，新规则已生效。"],
+  fromPanel: ["In effect: changes saved from this panel. The config file is untouched; editing it replaces them.", "当前生效：面板保存的改动。配置文件未被修改；一旦修改配置文件，将以文件为准并丢弃这些改动。"],
+  fromFile: ["In effect: the config file.", "当前生效：配置文件。"],
+  discard: ["Discard changes", "放弃更改"],
+  unsaved: ["Unsaved changes", "有未保存的更改"],
+  clean: ["Saving applies at once and leaves the config file untouched.", "保存后立即生效，不会改动配置文件。"],
+  reload: ["Load the current config", "加载当前配置"],
+};
+const t = (key, ...args) => args.reduce((s, v, i) => s.replace("{" + i + "}", v), TEXT[key][zh ? 1 : 0]);
+const STOP = Symbol("stop");
+const app = document.getElementById("app");
+let screen = "loading";
+let tab = "overview";
+let users = null;
+let lost = false;
+let draft = null;
+let revision = null;
+let source = "file";
+let dirty = false;
+let saving = false;
+let notice = null;
+let loginError = false;
+
+function h(tag, props, ...kids) {
+  const el = document.createElement(tag);
+  for (const kid of kids.flat()) if (kid != null && kid !== false) el.append(kid);
+  for (const [key, value] of Object.entries(props || {})) {
+    if (key.startsWith("on")) el.addEventListener(key.slice(2), value);
+    else if (key === "class") el.className = value;
+    else if (key === "value" || key === "checked" || key === "disabled") el[key] = value;
+    else if (value != null && value !== false) el.setAttribute(key, value);
+  }
+  return el;
+}
+
+function fmt(bytes) {
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = bytes, unit = 0;
+  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++; }
+  return unit === 0 ? bytes + "B" : value.toFixed(2) + units[unit];
+}
+
+async function call(method, path, body) {
+  let response;
+  try {
+    response = await fetch("/dashboard/api/" + path, {
+      method,
+      credentials: "same-origin",
+      headers: body ? { "Content-Type": "application/json" } : {},
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch {
+    throw new Error(t("lost"));
+  }
+  if (response.status === 404) { show("gone"); throw STOP; }
+  if (response.status === 401 && path !== "login") { show("login"); throw STOP; }
+  return response;
+}
+
+function show(next) {
+  screen = next;
+  render();
+}
+
+async function refresh() {
+  try {
+    const response = await call("GET", "status");
+    users = (await response.json()).users;
+    lost = false;
+  } catch (e) {
+    if (e === STOP) return;
+    lost = true;
+  }
+  if (screen !== "main") show("main");
+  else if (tab === "overview") render();
+  else renderTop();
+}
+
+function render() {
+  if (screen === "login") app.replaceChildren(loginView());
+  else if (screen === "gone") app.replaceChildren(goneView());
+  else if (screen === "loading") app.replaceChildren(h("div", { class: "door" }, h("p", null, t("loading"))));
+  else if (tab === "edit") app.replaceChildren(h("div", { class: "shell" }, topView(), editView()), saveBar());
+  else app.replaceChildren(h("div", { class: "shell" }, topView(), overviewView()));
+}
+
+function renderTop() {
+  const top = app.querySelector(".top");
+  if (top) top.replaceWith(topView());
+}
+
+function loginView() {
+  const username = h("input", { name: "username", autocomplete: "username", required: "" });
+  const password = h("input", { name: "password", type: "password", autocomplete: "current-password", required: "" });
+  const submit = async (event) => {
+    event.preventDefault();
+    try {
+      const response = await call("POST", "login", { username: username.value, password: password.value });
+      if (!response.ok) { loginError = true; render(); return; }
+      loginError = false;
+      screen = "loading";
+      refresh();
+    } catch (e) {
+      if (e !== STOP) { loginError = true; render(); }
+    }
+  };
+  return h("main", { class: "door" },
+    h("h1", null, "ports-box"),
+    h("p", null, t("signInLead")),
+    h("form", { onsubmit: submit },
+      h("label", { class: "field" }, h("span", null, t("username")), username),
+      h("label", { class: "field" }, h("span", null, t("password")), password),
+      loginError && h("p", { class: "error", role: "alert" }, t("wrongLogin")),
+      h("button", { class: "primary" }, t("signIn"))));
+}
+
+function goneView() {
+  return h("main", { class: "door" },
+    h("h1", null, t("goneTitle")),
+    h("p", null, t("goneLead", location.origin + "/?token=…")));
+}
+
+function topView() {
+  const go = (next) => () => {
+    if (next === "edit") openEdit(false);
+    else { tab = next; render(); refresh(); }
+  };
+  const signOut = async () => {
+    if (dirty && !confirm(t("discard") + "?")) return;
+    try { await call("POST", "logout"); } catch (e) { if (e === STOP) return; }
+    draft = null; dirty = false; users = null;
+    show("login");
+  };
+  return h("header", { class: "top" },
+    h("h1", { class: "brand" }, "ports-box"),
+    h("nav", { class: "tabs" },
+      h("button", { class: "tab", "aria-current": tab === "overview" ? "page" : null, onclick: go("overview") }, t("overview")),
+      h("button", { class: "tab", "aria-current": tab === "edit" ? "page" : null, onclick: go("edit") }, t("edit"))),
+    lost && h("span", { class: "lost", role: "status" }, t("lost")),
+    h("button", { class: "plain", onclick: signOut }, t("signOut")));
+}
+
+function overviewView() {
+  if (!users) return h("p", { class: "empty" }, t("loading"));
+  if (!users.length) return h("p", { class: "empty" }, t("noUsers"));
+  return h("main", null, users.map(userView));
+}
+
+function userView(user) {
+  const limited = user.limit_bytes != null;
+  const share = limited && user.limit_bytes > 0 ? Math.min(1, user.used_bytes / user.limit_bytes) : limited ? 1 : 0;
+  const level = user.exhausted ? " full" : share >= 0.9 ? " near" : "";
+  return h("section", { class: "user" },
+    h("div", { class: "user-head" },
+      h("h2", { class: "user-name" }, user.name),
+      user.exhausted && h("span", { class: "flag" }, t("exhausted")),
+      h("span", { class: "spent" }, limited ? t("usedOf", user.used, user.total) : t("usedOnly", user.used))),
+    limited && h("div", { class: "meter" + level, role: "img", "aria-label": Math.round(share * 100) + "%" },
+      h("i", { style: "width:" + (share * 100).toFixed(2) + "%" })),
+    h("p", { class: "facts" },
+      limited && h("span", null, t("remaining"), " ", h("b", null, user.remaining)),
+      h("span", null, t("thisHour"), " ", h("b", null, user.hour_used)),
+      h("span", null, t("upload"), " ", h("b", null, fmt(user.upload_bytes))),
+      h("span", null, t("download"), " ", h("b", null, fmt(user.download_bytes)))),
+    user.rules.length
+      ? h("ul", { class: "routes" }, user.rules.map(routeView))
+      : h("p", { class: "empty" }, t("noRules")));
+}
+
+function routeView(rule) {
+  const active = rule.targets.findIndex((target) => target.active);
+  const state = !rule.enabled ? " off"
+    : active >= 0 && !rule.targets[active].healthy ? " down"
+    : active > 0 ? " fallback" : "";
+  return h("li", { class: "route" + state },
+    h("span", { class: "proto" }, rule.protocol === "both" ? "tcp+udp" : rule.protocol),
+    h("span", { class: "mono" }, rule.listen),
+    h("span", { class: "wire", "aria-hidden": "true" }),
+    h("ul", { class: "targets" }, rule.targets.map((target) => {
+      const kind = !rule.enabled ? "" : !target.healthy ? " dead" : target.active ? " active" : "";
+      const word = !rule.enabled ? "" : !target.healthy ? t("dead") : target.active ? t("inUse") : t("standby");
+      return h("li", { class: "target" + kind },
+        h("i", { class: "dot" }),
+        h("span", { class: "mono" }, target.addr),
+        rule.targets.length > 1 || kind === " dead" ? h("span", { class: "state" }, word) : null);
+    })),
+    h("span", { class: "label" }, rule.enabled ? rule.tag : [rule.tag, t("off")].filter(Boolean).join(", ")));
+}
+
+function toDraft(config) {
+  return {
+    total_quota: String(config.total_quota ?? ""),
+    users: config.users.map((user) => ({
+      name: user.name,
+      quota: String(user.quota ?? ""),
+      rules: user.rules.map((rule) => ({
+        listen: rule.listen,
+        target: rule.target,
+        fallback: (rule.fallback || []).join(", "),
+        protocol: rule.protocol || "both",
+        check_secs: String(rule.check_secs ?? 10),
+        tag: rule.tag || "",
+        enabled: rule.enabled !== false,
+      })),
+    })),
+  };
+}
+
+function size(text) {
+  const value = text.trim();
+  if (!value) return null;
+  return /^\d+$/.test(value) ? Number(value) : value;
+}
+
+function fromDraft() {
+  return {
+    revision,
+    total_quota: size(draft.total_quota),
+    users: draft.users.map((user) => ({
+      name: user.name.trim(),
+      quota: size(user.quota),
+      rules: user.rules.map((rule) => {
+        const out = {
+          listen: rule.listen.trim(),
+          target: rule.target.trim(),
+          fallback: rule.fallback.split(/[\s,，]+/).filter(Boolean),
+          protocol: rule.protocol,
+          check_secs: Number(rule.check_secs),
+          enabled: rule.enabled,
+        };
+        if (rule.tag.trim()) out.tag = rule.tag.trim();
+        return out;
+      }),
+    })),
+  };
+}
+
+async function openEdit(force) {
+  if (!draft || force) {
+    try {
+      const response = await call("GET", "config");
+      const config = await response.json();
+      revision = config.revision;
+      source = config.source;
+      draft = toDraft(config);
+      dirty = false;
+      notice = null;
+    } catch (e) {
+      if (e === STOP) return;
+      lost = true;
+      renderTop();
+      return;
+    }
+  }
+  tab = "edit";
+  render();
+}
+
+function touch() {
+  if (dirty && !notice) return;
+  dirty = true;
+  notice = null;
+  renderBar();
+}
+
+function change(mutate) {
+  mutate();
+  dirty = true;
+  notice = null;
+  render();
+}
+
+function field(label, object, key, extra) {
+  const input = h("input", Object.assign({
+    value: object[key],
+    spellcheck: "false",
+    autocomplete: "off",
+    oninput: () => { object[key] = input.value; touch(); },
+  }, extra));
+  return h("label", { class: "field" }, h("span", null, label), input);
+}
+
+function ruleEditor(user, rule) {
+  const enabled = h("input", {
+    type: "checkbox", checked: rule.enabled,
+    onchange: () => { rule.enabled = enabled.checked; touch(); },
+  });
+  const protocol = h("select", {
+    value: rule.protocol,
+    onchange: () => { rule.protocol = protocol.value; touch(); },
+  }, [["both", "tcp+udp"], ["tcp", "tcp"], ["udp", "udp"]].map(([value, text]) => h("option", { value }, text)));
+  const remove = () => change(() => user.rules.splice(user.rules.indexOf(rule), 1));
+  return h("div", { class: "edit-rule" },
+    h("label", { class: "on" }, h("span", null, t("on")), enabled),
+    h("label", { class: "field" }, h("span", null, t("protocol")), protocol),
+    field(t("listen"), rule, "listen", { class: "mono", placeholder: "0.0.0.0:8080" }),
+    field(t("target"), rule, "target", { class: "mono", placeholder: "10.0.0.2:80" }),
+    field(t("fallback"), rule, "fallback", { class: "mono", placeholder: t("fallbackPlaceholder") }),
+    field(t("tag"), rule, "tag", { placeholder: t("none") }),
+    field(t("check"), rule, "check_secs", { type: "number", min: "1" }),
+    h("button", { class: "quiet", type: "button", onclick: remove }, t("removeRule")));
+}
+
+function userEditor(user) {
+  const blank = { listen: "", target: "", fallback: "", protocol: "both", check_secs: "10", tag: "", enabled: true };
+  return h("section", { class: "edit-user" },
+    h("div", { class: "form-row" },
+      field(t("name"), user, "name"),
+      field(t("quota"), user, "quota", { placeholder: draft.total_quota.trim() ? t("quotaPlaceholder") : t("none") }),
+      h("button", { class: "quiet", type: "button", onclick: () => change(() => draft.users.splice(draft.users.indexOf(user), 1)) }, t("removeUser"))),
+    user.rules.map((rule) => ruleEditor(user, rule)),
+    h("div", { class: "adders" },
+      h("button", { class: "plain", type: "button", onclick: () => change(() => user.rules.push(Object.assign({}, blank))) }, t("addRule"))));
+}
+
+function editView() {
+  return h("main", null,
+    h("p", { class: "source" }, t(source === "panel" ? "fromPanel" : "fromFile")),
+    h("section", { class: "totals" },
+      h("div", { class: "form-row" }, field(t("totalQuota"), draft, "total_quota", { placeholder: t("none") })),
+      h("p", { class: "hint" }, t("totalHint"))),
+    draft.users.map(userEditor),
+    h("div", { class: "adders" },
+      h("button", { class: "plain", type: "button", onclick: () => change(() => draft.users.push({ name: "", quota: "", rules: [] })) }, t("addUser"))));
+}
+
+function saveBar() {
+  const kind = notice ? notice.kind : "";
+  const text = notice ? notice.text : dirty ? t("unsaved") : t("clean");
+  return h("footer", { class: "savebar" }, h("div", null,
+    h("p", { class: kind === "ok" ? "ok" : kind ? "error" : "", role: "status" }, text),
+    kind === "conflict"
+      ? h("button", { class: "plain", onclick: () => openEdit(true) }, t("reload"))
+      : h("button", { class: "plain", disabled: !dirty || saving, onclick: () => openEdit(true) }, t("discard")),
+    h("button", { class: "plain primary", disabled: !dirty || saving, onclick: saveConfig }, saving ? t("saving") : t("save"))));
+}
+
+function renderBar() {
+  const bar = app.querySelector(".savebar");
+  if (bar) bar.replaceWith(saveBar());
+}
+
+async function saveConfig() {
+  saving = true;
+  notice = null;
+  renderBar();
+  try {
+    const response = await call("PUT", "config", fromDraft());
+    const body = await response.json().catch(() => ({}));
+    if (response.ok) {
+      revision = body.revision;
+      source = "panel";
+      dirty = false;
+      notice = { kind: "ok", text: t("saved") };
+    } else {
+      notice = { kind: response.status === 409 ? "conflict" : "error", text: body.error || response.statusText };
+    }
+  } catch (e) {
+    if (e === STOP) { saving = false; return; }
+    notice = { kind: "error", text: e.message };
+  }
+  saving = false;
+  renderBar();
+}
+
+addEventListener("beforeunload", (event) => { if (dirty) event.preventDefault(); });
+setInterval(() => { if (screen === "main" && !document.hidden) refresh(); }, 3000);
+document.documentElement.lang = zh ? "zh" : "en";
+render();
+refresh();
+</script>
+</body>
+</html>

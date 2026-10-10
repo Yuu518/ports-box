@@ -9,6 +9,7 @@ A TCP/UDP port forwarder for Linux with per-user traffic quotas.
 - **Hard stop on quota exhaustion**: new connections are rejected, in-flight connections are closed immediately, UDP packets are dropped; service resumes as soon as the quota is raised in the config (no restart needed)
 - **Usage persistence (optional)**: with `state_file` configured, used traffic is stored in a SQLite database (flushed every 10 seconds by default and on exit), so counters survive restarts; without it, usage is kept in memory only and resets to zero on restart
 - **Config auto-reload**: edits to the config file are picked up automatically without a restart; an invalid config is rejected and the running one is kept (see "Config auto-reload" below)
+- **Web panel (optional, off by default)**: a built-in dashboard at `/dashboard` shows usage, rules, and target health, and edits users, rules, and quotas; it sits behind an entry token plus a username and password (see "Web panel" below)
 - **Query API**: an HTTP interface returns each user's total/used/remaining traffic; compatible with Sub-Store (`subscription-userinfo` response header)
 
 ## Build and run
@@ -135,6 +136,13 @@ Full example:
     "listen": "127.0.0.1:7070",
     "token": "changeme"
   },
+  "panel": {
+    "enabled": true,
+    "listen": "127.0.0.1:8888",
+    "token": "changeme",
+    "username": "admin",
+    "password": "changeme"
+  },
   "total_quota": "100GB",
   "users": [
     {
@@ -166,6 +174,12 @@ state_file:
 api:
   listen: 127.0.0.1:7070
   token: changeme
+panel:
+  enabled: true
+  listen: 127.0.0.1:8888
+  token: changeme
+  username: admin
+  password: changeme
 total_quota: 100GB
 users:
   - name: alice
@@ -192,6 +206,7 @@ users:
 |---|---|
 | `state_file` | Optional; omit the whole section to disable usage persistence (counters reset on restart). Subfields: `enabled` (default `true`, set `false` to disable temporarily), `path` (SQLite database path, default `state.db`, relative to the working directory), `flush_secs` (flush interval in seconds, default `10`) |
 | `api` | Optional; omit to not start the query API. `token` is also optional; when set, every request must carry the token |
+| `panel` | Optional; the web panel only starts when `enabled` is explicitly `true` (default `false`). Subfields: `listen` (default `127.0.0.1:8888`), `token` (entry token), `username`, `password` — these three are required once the panel is enabled — and `path` (where the panel stores its changes, default `panel.json`, relative to the working directory). See "Web panel" below |
 | `total_quota` | Optional; users without their own `quota` split this total evenly |
 | `rules` | Single-user shorthand: a top-level rule list, equivalent to a user named `default`; mutually exclusive with `users` |
 | `users[].quota` | Optional; this user's quota, taking precedence over the `total_quota` share. When neither `quota` nor `total_quota` is set, the user is unlimited |
@@ -234,9 +249,29 @@ The config file is checked every 3 seconds; when its content changes (and stays 
 - A changed rule (different `target`, `fallback`, `protocol`, `check_secs`, or owner) is restarted: its existing connections are closed and new ones use the new settings. The listening socket is handed over, not rebound, so the port never goes away.
 - Quota changes (`quota`, `total_quota`) apply immediately and keep used traffic: raising a quota re-enables an exhausted user, lowering it below the used amount stops that user's traffic at once.
 - New users start from the usage stored in `state_file` (if any); removed users have their usage flushed to it first.
-- Changes to `api` and `state_file` are not applied live; a warning is logged and they take effect after a restart.
+- Changes to `api`, `panel`, and `state_file` are not applied live; a warning is logged and they take effect after a restart.
 
 With Docker, a single-file bind mount (`./config.json:/etc/ports-box/config.json`) only sees edits that overwrite the file in place (e.g. `cp new.json config.json`); editors that save by writing a new file and renaming it replace the host file, which the container no longer sees. Mount the directory instead if you edit the config that way. Pass `--no-reload` to turn auto-reload off.
+
+## Web panel
+
+The panel is off unless the config says `"panel": { "enabled": true, ... }`. It listens on `127.0.0.1:8888` by default and needs a `token`, a `username`, and a `password`; startup fails if any of the three is missing.
+
+1. Open `http://127.0.0.1:8888/?token=<token>`. A correct token redirects to `/dashboard`; without it every path on the panel port answers `404`, including `/dashboard` and the sign-in endpoint.
+2. Sign in with the username and password.
+3. For the next 7 days the browser can open `/dashboard` directly. Sessions live in memory, so a restart requires the token link and a new sign-in.
+
+**Overview** shows each user's quota, billed usage, current-hour usage, and raw upload/download, plus every rule with its targets: which one is in use, which are on standby, and which are down. It refreshes every 3 seconds.
+
+**Users and rules** edits `total_quota`, users, quotas, and rules. Saving validates the result, binds any new ports, and applies it immediately (it works with `--no-reload` too); if anything fails, nothing changes and the error is shown. Things to know:
+
+- Saving **never touches the config file**. The panel keeps its changes in its own store, `panel.path` (default `panel.json`, relative to the working directory), and they survive restarts.
+- **Editing the config file takes over again.** Whoever changed things last wins: as soon as the config file's content changes — while running, or while the process was stopped — the file is used as written, the panel's saved changes are dropped, and `panel.json` is deleted. Any change to the file counts, even one outside `users` and `total_quota`.
+- If a changed config file is rejected (syntax error, port in use, …), the running config, including the panel's changes, stays in effect until the file is fixed.
+- The `api`, `state_file`, and `panel` sections always come from the config file and cannot be edited from the panel.
+- The working directory must be writable (as it already is for `state.db`); the config file itself can stay read-only, so a Docker `:ro` mount keeps working. Without host networking, set `panel.listen` to `0.0.0.0:8888` and map the port.
+
+The panel speaks plain HTTP and the token and password are stored in the config file as written. To reach it from another machine, use an SSH tunnel or put it behind an HTTPS reverse proxy; a warning is logged when it listens on a non-loopback address.
 
 ## Query API
 
@@ -291,7 +326,7 @@ systemctl status ports-box      # check status
 journalctl -u ports-box -f      # follow logs
 ```
 
-Config changes (rules, quotas) are applied automatically, see "Config auto-reload"; changes to `api` / `state_file` need `systemctl restart ports-box`;
+Config changes (rules, quotas) are applied automatically, see "Config auto-reload"; changes to `api` / `panel` / `state_file` need `systemctl restart ports-box`;
 stopping/restarting writes usage to `state.db` first, so no counters are lost.
 
 ---

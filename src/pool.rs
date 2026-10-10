@@ -115,8 +115,11 @@ impl TargetPool {
         elapsed >= interval.as_millis() as u64
     }
 
-    #[cfg(test)]
-    pub(crate) fn is_healthy(&self, i: usize) -> bool {
+    pub fn targets(&self) -> &[Arc<str>] {
+        &self.targets
+    }
+
+    pub fn is_healthy(&self, i: usize) -> bool {
         self.healthy[i].load(Ordering::Relaxed)
     }
 

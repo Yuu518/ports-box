@@ -3,15 +3,17 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
     pub state_file: Option<StateFileConfig>,
     #[serde(default)]
     pub api: Option<ApiConfig>,
+    #[serde(default)]
+    pub panel: Option<PanelConfig>,
     #[serde(default)]
     pub total_quota: Option<ByteSize>,
     /// Single-user shorthand: top-level rules become a user named
@@ -22,9 +24,15 @@ pub struct Config {
     pub users: Vec<UserConfig>,
 }
 
+impl Config {
+    pub fn panel(&self) -> Option<&PanelConfig> {
+        self.panel.as_ref().filter(|panel| panel.enabled)
+    }
+}
+
 /// Optional usage persistence. Omitting the whole section keeps counters
 /// in memory only, so they reset on restart.
-#[derive(Debug, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StateFileConfig {
     #[serde(default = "default_true")]
@@ -35,7 +43,7 @@ pub struct StateFileConfig {
     pub flush_secs: u64,
 }
 
-#[derive(Debug, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApiConfig {
     pub listen: SocketAddr,
@@ -43,33 +51,57 @@ pub struct ApiConfig {
     pub token: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PanelConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_panel_listen")]
+    pub listen: SocketAddr,
+    #[serde(default)]
+    pub token: String,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    #[serde(default = "default_panel_path")]
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserConfig {
     pub name: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota: Option<ByteSize>,
     pub rules: Vec<Rule>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rule {
     pub listen: SocketAddr,
     pub target: String,
     /// Backup targets tried in priority order when the target above is
     /// unreachable. Accepts a single string or a list of strings.
-    #[serde(default, deserialize_with = "string_or_strings")]
+    #[serde(
+        default,
+        deserialize_with = "string_or_strings",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub fallback: Vec<String>,
     /// Health check interval (seconds) for rules with fallbacks; also the
     /// retry cooldown for UDP-only rules, which cannot be probed.
-    #[serde(default = "default_check_secs")]
+    #[serde(
+        default = "default_check_secs",
+        skip_serializing_if = "is_default_check_secs"
+    )]
     pub check_secs: u64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Protocol::is_both")]
     pub protocol: Protocol,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub enabled: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
 }
 
@@ -104,7 +136,7 @@ fn string_or_strings<'de, D: serde::Deserializer<'de>>(
     deserializer.deserialize_any(Visitor)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Protocol {
     #[default]
@@ -131,6 +163,10 @@ impl Protocol {
     pub fn udp(self) -> bool {
         matches!(self, Protocol::Both | Protocol::Udp)
     }
+
+    fn is_both(&self) -> bool {
+        matches!(self, Protocol::Both)
+    }
 }
 
 /// Accepts an IP literal with port, or a `host:port` shape whose hostname is
@@ -154,8 +190,24 @@ fn default_true() -> bool {
     true
 }
 
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
 fn default_check_secs() -> u64 {
     10
+}
+
+fn is_default_check_secs(secs: &u64) -> bool {
+    *secs == default_check_secs()
+}
+
+fn default_panel_listen() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 8888))
+}
+
+fn default_panel_path() -> PathBuf {
+    PathBuf::from("panel.json")
 }
 
 /// A byte count that deserializes from either a plain integer (bytes) or a
@@ -190,6 +242,24 @@ impl<'de> Deserialize<'de> for ByteSize {
         }
 
         deserializer.deserialize_any(Visitor)
+    }
+}
+
+impl Serialize for ByteSize {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        const UNITS: [(u64, &str); 4] = [
+            (1 << 40, "TB"),
+            (1 << 30, "GB"),
+            (1 << 20, "MB"),
+            (1 << 10, "KB"),
+        ];
+        match UNITS
+            .iter()
+            .find(|(size, _)| self.0 != 0 && self.0.is_multiple_of(*size))
+        {
+            Some((size, unit)) => serializer.collect_str(&format_args!("{}{unit}", self.0 / size)),
+            None => serializer.serialize_u64(self.0),
+        }
     }
 }
 
@@ -229,6 +299,10 @@ pub fn format_size(bytes: u64) -> String {
         return format!("{bytes}B");
     }
     format!("{value:.2}{}", UNITS[unit])
+}
+
+pub fn check(config: Config) -> Result<Config, String> {
+    finalize(config)
 }
 
 pub fn parse(raw: &str, path: &Path) -> Result<Config, String> {
@@ -275,6 +349,22 @@ fn validate(config: &Config) -> Result<(), String> {
     let mut udp_listens = HashSet::new();
     if let Some(api) = &config.api {
         tcp_listens.insert(api.listen);
+    }
+    if let Some(panel) = config.panel() {
+        for (field, value) in [
+            ("token", &panel.token),
+            ("username", &panel.username),
+            ("password", &panel.password),
+        ] {
+            if value.is_empty() {
+                return Err(format!(
+                    "panel {field} must be set when the panel is enabled"
+                ));
+            }
+        }
+        if !tcp_listens.insert(panel.listen) {
+            return Err(format!("duplicate TCP listen address {}", panel.listen));
+        }
     }
 
     for user in &config.users {
@@ -725,6 +815,151 @@ users:
         .unwrap();
         let config = load(&path).unwrap();
         assert_eq!(config.total_quota, Some(ByteSize(1 << 20)));
+    }
+
+    const RULE: &str = r#""rules": [{"listen": "0.0.0.0:1", "target": "x:1"}]"#;
+
+    #[test]
+    fn panel_is_off_unless_explicitly_enabled() {
+        let config = parse_config(&format!("{{{RULE}}}")).unwrap();
+        assert!(config.panel().is_none());
+
+        let config = parse_config(&format!(r#"{{"panel": {{}}, {RULE}}}"#)).unwrap();
+        assert!(config.panel().is_none());
+        assert_eq!(
+            config.panel.unwrap().listen,
+            "127.0.0.1:8888".parse().unwrap()
+        );
+
+        let config = parse_config(&format!(
+            r#"{{"panel": {{"enabled": true, "token": "t", "username": "u", "password": "p"}}, {RULE}}}"#
+        ))
+        .unwrap();
+        let panel = config.panel().unwrap();
+        assert_eq!(panel.listen, "127.0.0.1:8888".parse().unwrap());
+        assert_eq!(panel.token, "t");
+        assert_eq!(panel.path, PathBuf::from("panel.json"));
+    }
+
+    #[test]
+    fn enabled_panel_requires_token_and_credentials() {
+        for (panel, missing) in [
+            (
+                r#"{"enabled": true, "username": "u", "password": "p"}"#,
+                "token",
+            ),
+            (
+                r#"{"enabled": true, "token": "t", "password": "p"}"#,
+                "username",
+            ),
+            (
+                r#"{"enabled": true, "token": "t", "username": "u", "password": ""}"#,
+                "password",
+            ),
+        ] {
+            let err = parse_config(&format!(r#"{{"panel": {panel}, {RULE}}}"#)).unwrap_err();
+            assert!(err.contains(&format!("panel {missing}")), "{err}");
+        }
+    }
+
+    #[test]
+    fn panel_listen_conflicts_only_when_enabled() {
+        let config = |enabled: bool, api: &str| {
+            parse_config(&format!(
+                r#"{{
+                    "api": {{"listen": "{api}"}},
+                    "panel": {{"enabled": {enabled}, "listen": "127.0.0.1:1", "token": "t", "username": "u", "password": "p"}},
+                    "rules": [{{"listen": "127.0.0.1:1", "target": "x:1", "protocol": "udp"}}]
+                }}"#
+            ))
+        };
+        config(true, "127.0.0.1:2").unwrap();
+        config(false, "127.0.0.1:1").unwrap();
+        let err = config(true, "127.0.0.1:1").unwrap_err();
+        assert!(err.contains("duplicate TCP"), "{err}");
+
+        let err = parse_config(
+            r#"{
+                "panel": {"enabled": true, "listen": "127.0.0.1:1", "token": "t", "username": "u", "password": "p"},
+                "rules": [{"listen": "127.0.0.1:1", "target": "x:1"}]
+            }"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("duplicate TCP"), "{err}");
+    }
+
+    #[test]
+    fn byte_size_serializes_to_exact_unit_or_bytes() {
+        let json = |bytes: u64| serde_json::to_string(&ByteSize(bytes)).unwrap();
+        assert_eq!(json(30 << 30), r#""30GB""#);
+        assert_eq!(json(1 << 40), r#""1TB""#);
+        assert_eq!(json(1536), "1536");
+        assert_eq!(json(2048), r#""2KB""#);
+        assert_eq!(json(0), "0");
+    }
+
+    #[test]
+    fn users_round_trip_through_json() {
+        let source = r#"{
+            "users": [
+                {"name": "a", "quota": 1536, "rules": [
+                    {"listen": "0.0.0.0:1", "target": "x:1", "fallback": ["y:1", "z:1"], "check_secs": 3, "tag": "web"},
+                    {"listen": "0.0.0.0:2", "target": "x:1", "protocol": "udp", "enabled": false}
+                ]},
+                {"name": "b", "quota": "30GB", "rules": [{"listen": "0.0.0.0:3", "target": "x:1"}]}
+            ]
+        }"#;
+        let config = parse_config(source).unwrap();
+        let json = serde_json::to_string(&config.users).unwrap();
+        let users: Vec<UserConfig> = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&users).unwrap(), json);
+        assert_eq!(users[0].quota, Some(ByteSize(1536)));
+        assert_eq!(users[1].quota, Some(ByteSize(30 << 30)));
+        let rules = &users[0].rules;
+        assert_eq!(rules[0].fallback, vec!["y:1", "z:1"]);
+        assert_eq!(rules[0].check_secs, 3);
+        assert_eq!(rules[0].tag.as_deref(), Some("web"));
+        assert_eq!(rules[1].protocol, Protocol::Udp);
+        assert!(!rules[1].enabled);
+        assert_eq!(users[1].rules[0].check_secs, 10);
+        assert!(!json.contains("check_secs\":10"), "{json}");
+        assert!(json.contains(r#""quota":1536"#), "{json}");
+    }
+
+    #[test]
+    fn check_validates_an_edited_config() {
+        let config = parse_config(&format!(
+            r#"{{"panel": {{"enabled": true, "listen": "127.0.0.1:9", "token": "t", "username": "u", "password": "p"}}, {RULE}}}"#
+        ))
+        .unwrap();
+        let users = |listen: &str| -> Vec<UserConfig> {
+            serde_json::from_str(&format!(
+                r#"[{{"name": "a", "rules": [{{"listen": "{listen}", "target": "x:1"}}]}}]"#
+            ))
+            .unwrap()
+        };
+        let edited = check(Config {
+            total_quota: Some(ByteSize(5)),
+            users: users("127.0.0.1:2"),
+            ..config.clone()
+        })
+        .unwrap();
+        assert_eq!(edited.users[0].name, "a");
+        assert_eq!(edited.panel, config.panel);
+        assert_eq!(resolve_quotas(&edited)["a"], Some(5));
+
+        let err = check(Config {
+            users: users("127.0.0.1:9"),
+            ..config.clone()
+        })
+        .unwrap_err();
+        assert!(err.contains("duplicate TCP"), "{err}");
+        let err = check(Config {
+            users: Vec::new(),
+            ..config
+        })
+        .unwrap_err();
+        assert!(err.contains("no users or rules"), "{err}");
     }
 
     #[test]

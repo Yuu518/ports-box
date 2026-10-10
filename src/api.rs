@@ -21,7 +21,7 @@ pub struct ApiState {
 }
 
 #[derive(Serialize)]
-struct UserUsage {
+pub(crate) struct UserUsage {
     name: String,
     total: String,
     used: String,
@@ -30,7 +30,7 @@ struct UserUsage {
 }
 
 impl UserUsage {
-    fn new(q: &UserQuota, now_hour: i64) -> Self {
+    pub(crate) fn new(q: &UserQuota, now_hour: i64) -> Self {
         q.roll_over_at(now_hour);
         Self {
             name: q.name.clone(),
@@ -55,7 +55,7 @@ fn billed_split(q: &UserQuota) -> (u64, u64) {
     (billed_up, used as u64 - billed_up)
 }
 
-fn token_matches(given: &str, expected: &str) -> bool {
+pub(crate) fn token_matches(given: &str, expected: &str) -> bool {
     let (given, expected) = (given.as_bytes(), expected.as_bytes());
     given.len() == expected.len()
         && std::hint::black_box(

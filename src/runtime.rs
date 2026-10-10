@@ -86,8 +86,11 @@ impl RuleSpec {
     }
 }
 
+pub type PoolMap = HashMap<(SocketAddr, Protocol), Arc<TargetPool>>;
+
 struct RunningRule {
     _stop: watch::Sender<()>,
+    pool: Arc<TargetPool>,
     tcp: Option<Arc<TcpListener>>,
     udp: Option<Arc<UdpSocket>>,
 }
@@ -101,6 +104,7 @@ struct PreparedRule {
 pub struct Runtime {
     rules: HashMap<RuleSpec, RunningRule>,
     users: watch::Sender<Arc<UserSet>>,
+    pools: watch::Sender<Arc<PoolMap>>,
     db: Option<Arc<StateDb>>,
     permits: Arc<Semaphore>,
 }
@@ -110,6 +114,7 @@ impl Runtime {
         Self {
             rules: HashMap::new(),
             users: watch::Sender::new(Arc::default()),
+            pools: watch::Sender::new(Arc::default()),
             db,
             permits: pool::probe_permits(),
         }
@@ -117,6 +122,10 @@ impl Runtime {
 
     pub fn users(&self) -> watch::Receiver<Arc<UserSet>> {
         self.users.subscribe()
+    }
+
+    pub fn pools(&self) -> watch::Receiver<Arc<PoolMap>> {
+        self.pools.subscribe()
     }
 
     pub async fn apply(&mut self, config: &Config) -> Result<(), String> {
@@ -266,6 +275,12 @@ impl Runtime {
             }
         }
         self.users.send_replace(next);
+        self.pools.send_replace(Arc::new(
+            self.rules
+                .iter()
+                .map(|(spec, rule)| ((spec.listen, spec.protocol), rule.pool.clone()))
+                .collect(),
+        ));
 
         if !first {
             info!(
@@ -304,13 +319,14 @@ impl Runtime {
             ));
         }
         if let Some(socket) = &udp {
-            tokio::spawn(udp::serve(socket.clone(), pool, quota, stop));
+            tokio::spawn(udp::serve(socket.clone(), pool.clone(), quota, stop));
         }
         info!(user = %spec.user, "{}", spec.describe());
         self.rules.insert(
             spec,
             RunningRule {
                 _stop: stop_tx,
+                pool,
                 tcp,
                 udp,
             },

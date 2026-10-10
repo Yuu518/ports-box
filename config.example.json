@@ -8,6 +8,13 @@
     "listen": "127.0.0.1:7070",
     "token": "changeme"
   },
+  "panel": {
+    "enabled": false,
+    "listen": "127.0.0.1:8888",
+    "token": "changeme",
+    "username": "admin",
+    "password": "changeme"
+  },
   "total_quota": "100GB",
   "users": [
     {

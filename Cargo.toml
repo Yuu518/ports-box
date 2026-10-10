@@ -8,6 +8,7 @@ license = "MIT"
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "signal", "sync", "macros", "fs"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 json5 = "0.4"
 serde_yaml_ng = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
@@ -15,6 +16,7 @@ clap = { version = "4", features = ["derive"] }
 axum = "0.8"
 rusqlite = { version = "0.37", features = ["bundled"] }
 socket2 = { version = "0.6", features = ["all"] }
+getrandom = "0.3"
 hickory-resolver = "0.25"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "chrono"] }
@@ -23,7 +25,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "chrono"] }
 libc = "0.2"
 
 [dev-dependencies]
-serde_json = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }

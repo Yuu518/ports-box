@@ -1,6 +1,7 @@
 mod api;
 mod config;
 mod dns;
+mod panel;
 mod pool;
 mod quota;
 mod runtime;
@@ -19,6 +20,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
 use crate::config::Config;
+use crate::panel::{ConfigEdit, Live, SaveError, Store};
 use crate::runtime::Runtime;
 use crate::state::StateDb;
 
@@ -132,8 +134,14 @@ async fn run(args: Args) -> Result<(), String> {
 
     // Bind everything up front so a bad config fails fast, before any
     // forwarding starts.
+    let store_path = config.panel().map(|panel| panel.path.clone());
+    let stored = store_path
+        .as_deref()
+        .and_then(|path| restore(&config, &raw, path));
+    let from_panel = stored.is_some();
+    let effective = stored.unwrap_or_else(|| config.clone());
     let mut runtime = Runtime::new(db.as_ref().map(|(db, _)| db.clone()));
-    runtime.apply(&config).await?;
+    runtime.apply(&effective).await?;
 
     if let Some(api) = &config.api {
         let listener = TcpListener::bind(api.listen)
@@ -154,6 +162,37 @@ async fn run(args: Args) -> Result<(), String> {
         });
     }
 
+    let live = watch::Sender::new(Arc::new(Live {
+        config: effective,
+        revision: 0,
+        from_panel,
+    }));
+    let (save_tx, mut save_rx) = mpsc::channel(1);
+    if let Some(panel) = config.panel() {
+        let listener = TcpListener::bind(panel.listen)
+            .await
+            .map_err(|e| format!("cannot bind panel {}: {e}", panel.listen))?;
+        info!("panel listening on http://{}", panel.listen);
+        if !panel.listen.ip().is_loopback() {
+            warn!(
+                "panel on {} is served over plain http: put it behind an https reverse proxy",
+                panel.listen
+            );
+        }
+        let router = panel::router(
+            panel,
+            live.subscribe(),
+            runtime.users(),
+            runtime.pools(),
+            save_tx,
+        );
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, router).await {
+                error!("panel server failed: {e}");
+            }
+        });
+    }
+
     let flusher = db.map(|(db, flush_interval)| {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let task = tokio::spawn(state::run_flush_task(
@@ -165,6 +204,7 @@ async fn run(args: Args) -> Result<(), String> {
         (shutdown_tx, task)
     });
 
+    let mut file_raw = raw.clone();
     let (reload_tx, mut reload_rx) = mpsc::channel(1);
     if args.no_reload {
         info!("config auto-reload disabled");
@@ -183,7 +223,23 @@ async fn run(args: Args) -> Result<(), String> {
         tokio::select! {
             _ = &mut shutdown => break,
             Some(raw) = reload_rx.recv() => {
-                reload(&mut runtime, &config, &args.config, &raw).await;
+                file_raw = raw;
+                if let Some(next) = reload(&mut runtime, &config, &args.config, &file_raw).await {
+                    if let Some(path) = &store_path
+                        && live.borrow().from_panel
+                    {
+                        info!("config file changed, dropping changes saved from the panel");
+                        panel::remove_store(path);
+                    }
+                    publish(&live, next, false);
+                }
+            }
+            Some(request) = save_rx.recv() => {
+                let result = match &store_path {
+                    Some(path) => save(&mut runtime, &live, path, &file_raw, request.edit).await,
+                    None => Err(SaveError::Failed("the panel is disabled".into())),
+                };
+                let _ = request.reply.send(result);
             }
         }
     }
@@ -200,25 +256,110 @@ async fn run(args: Args) -> Result<(), String> {
     Ok(())
 }
 
-async fn reload(runtime: &mut Runtime, initial: &Config, path: &Path, raw: &str) {
+fn restore(file: &Config, raw: &str, path: &Path) -> Option<Config> {
+    let store = panel::load_store(path)?;
+    if store.base != raw {
+        info!("config file changed since the panel last saved, dropping the panel's changes");
+        panel::remove_store(path);
+        return None;
+    }
+    let edited = Config {
+        total_quota: store.total_quota,
+        users: store.users,
+        ..file.clone()
+    };
+    match config::check(edited) {
+        Ok(config) => {
+            info!(
+                "using users and rules saved from the panel in {}",
+                path.display()
+            );
+            Some(config)
+        }
+        Err(e) => {
+            warn!("ignoring panel store {}: {e}", path.display());
+            panel::remove_store(path);
+            None
+        }
+    }
+}
+
+fn publish(live: &watch::Sender<Arc<Live>>, config: Config, from_panel: bool) -> u64 {
+    let revision = live.borrow().revision + 1;
+    live.send_replace(Arc::new(Live {
+        config,
+        revision,
+        from_panel,
+    }));
+    revision
+}
+
+async fn reload(runtime: &mut Runtime, initial: &Config, path: &Path, raw: &str) -> Option<Config> {
     info!("config file changed, reloading");
     let next = match config::parse(raw, path) {
         Ok(next) => next,
         Err(e) => {
             error!("config reload rejected, keeping current config: {e}");
-            return;
+            return None;
         }
     };
     if let Err(e) = runtime.apply(&next).await {
         error!("config reload rejected, keeping current config: {e}");
-        return;
+        return None;
     }
     if next.api != initial.api {
         warn!("api settings changed; restart to apply them");
     }
+    if next.panel != initial.panel {
+        warn!("panel settings changed; restart to apply them");
+    }
     if next.state_file != initial.state_file {
         warn!("state_file settings changed; restart to apply them");
     }
+    Some(next)
+}
+
+async fn save(
+    runtime: &mut Runtime,
+    live: &watch::Sender<Arc<Live>>,
+    path: &Path,
+    file_raw: &str,
+    edit: ConfigEdit,
+) -> Result<u64, SaveError> {
+    let current = live.borrow().clone();
+    if edit.revision != current.revision {
+        return Err(SaveError::Conflict(
+            "the config changed after this page loaded it".into(),
+        ));
+    }
+    let store = Store {
+        base: file_raw.to_owned(),
+        total_quota: edit.total_quota,
+        users: edit.users,
+    };
+    let next = config::check(Config {
+        total_quota: store.total_quota,
+        users: store.users.clone(),
+        ..current.config.clone()
+    })
+    .map_err(SaveError::Invalid)?;
+    let previous = tokio::fs::read(path).await.ok();
+    panel::write_store(path, &store)
+        .await
+        .map_err(SaveError::Failed)?;
+    if let Err(e) = runtime.apply(&next).await {
+        match previous {
+            Some(bytes) => {
+                if let Err(e) = tokio::fs::write(path, bytes).await {
+                    error!("cannot restore panel store {}: {e}", path.display());
+                }
+            }
+            None => panel::remove_store(path),
+        }
+        return Err(SaveError::Invalid(e));
+    }
+    info!("panel changes saved to {}", path.display());
+    Ok(publish(live, next, true))
 }
 
 #[cfg(unix)]
