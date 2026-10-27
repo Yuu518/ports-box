@@ -59,6 +59,11 @@ button, input, select { font: inherit; color: inherit; }
   color: var(--muted); cursor: pointer; white-space: nowrap;
 }
 .tab[aria-current="page"] { background: var(--sunk); color: var(--ink); font-weight: 600; }
+.top-end { display: flex; align-items: stretch; gap: 0.5rem; }
+.icon { display: inline-flex; align-items: center; justify-content: center; padding: 0.4rem 0.5rem; color: var(--muted); }
+.icon:hover { color: var(--ink); }
+.icon svg { display: block; width: 1.25rem; height: 1.25rem; }
+.corner { position: absolute; top: 1.25rem; right: 1.25rem; }
 .plain {
   border: 1px solid var(--line); background: var(--surface); padding: 0.35rem 0.8rem;
   border-radius: 0.4rem; cursor: pointer;
@@ -215,6 +220,9 @@ button, input, select { font: inherit; color: inherit; }
 }
 
 @media (max-width: 52rem) {
+  .top .tabs { order: 1; flex-basis: 100%; margin-right: 0; }
+  .top .lost { order: 2; }
+  .top-end { margin-left: auto; }
   .route { grid-template-columns: 4.6rem 1fr; }
   .route .wire { display: none; }
   .route .targets, .route .label { grid-column: 2; text-align: left; }
@@ -230,8 +238,13 @@ button, input, select { font: inherit; color: inherit; }
 <div id="app"></div>
 <script>
 "use strict";
-const zh = (navigator.language || "").toLowerCase().startsWith("zh");
+const LANG_KEY = "ports-box.lang";
+const LANG_ICON = '<path d="m5 8 6 6"/><path d="m4 14 6-6 2-3"/><path d="M2 5h12"/><path d="M7 2h1"/><path d="m22 22-5-10-5 10"/><path d="M14 18h6"/>';
+const SIGN_OUT_ICON = '<path d="m16 17 5-5-5-5"/><path d="M21 12H9"/><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>';
+const browserZh = (navigator.language || "").toLowerCase().startsWith("zh");
+let zh = savedLanguage() ?? browserZh;
 const TEXT = {
+  switchLang: ["Switch to Chinese", "切换到英文"],
   overview: ["Overview", "概览"],
   packages: ["Traffic packages", "流量包"],
   ledger: ["Ledger", "流水"],
@@ -394,6 +407,39 @@ const TEXT = {
   testIgnored: [" {0} in other regions not counted.", " 另有 {0} 个其他地域的包未计入。"],
 };
 const t = (key, ...args) => args.reduce((s, v, i) => s.replace("{" + i + "}", v), TEXT[key][zh ? 1 : 0]);
+const later = (key, ...args) => () => t(key, ...args);
+const say = (text) => (typeof text === "function" ? text() : text);
+const reason = (e) => e.text || e.message;
+const locale = () => (zh === browserZh ? undefined : zh ? "zh-CN" : "en");
+
+function savedLanguage() {
+  try {
+    const saved = localStorage.getItem(LANG_KEY);
+    if (saved === "zh" || saved === "en") return saved === "zh";
+  } catch {}
+  return null;
+}
+
+function setLanguage(next) {
+  zh = next;
+  try { localStorage.setItem(LANG_KEY, zh ? "zh" : "en"); } catch {}
+  document.documentElement.lang = zh ? "zh" : "en";
+  render();
+  const button = app.querySelector(".lang");
+  if (button) button.focus();
+}
+
+function iconButton(className, icon, label, onclick) {
+  const button = h("button", {
+    class: "plain icon " + className, type: "button", title: label, "aria-label": label, onclick,
+  });
+  button.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + icon + "</svg>";
+  return button;
+}
+
+function langButton(extra) {
+  return iconButton("lang" + (extra ? " " + extra : ""), LANG_ICON, t("switchLang"), () => setLanguage(!zh));
+}
 const STOP = Symbol("stop");
 const app = document.getElementById("app");
 let screen = "loading";
@@ -450,7 +496,7 @@ function signed(bytes, plus) {
 }
 
 function when(seconds) {
-  return new Date(seconds * 1000).toLocaleString();
+  return new Date(seconds * 1000).toLocaleString(locale());
 }
 
 function list(text) {
@@ -467,7 +513,7 @@ async function call(method, path, body) {
       body: body ? JSON.stringify(body) : undefined,
     });
   } catch {
-    throw new Error(t("lost"));
+    throw Object.assign(new Error(t("lost")), { text: later("lost") });
   }
   if (response.status === 404) { show("gone"); throw STOP; }
   if (response.status === 401 && path !== "login") { show("login"); throw STOP; }
@@ -511,9 +557,9 @@ async function refresh() {
 
 function render() {
   const shell = (...kids) => h("div", { class: "shell" }, topView(), kids);
-  if (screen === "login") app.replaceChildren(loginView());
-  else if (screen === "gone") app.replaceChildren(goneView());
-  else if (screen === "loading") app.replaceChildren(h("div", { class: "door" }, h("p", null, t("loading"))));
+  if (screen === "login") app.replaceChildren(langButton("corner"), loginView());
+  else if (screen === "gone") app.replaceChildren(langButton("corner"), goneView());
+  else if (screen === "loading") app.replaceChildren(langButton("corner"), h("div", { class: "door" }, h("p", null, t("loading"))));
   else if (tab === "edit") app.replaceChildren(shell(editView()), saveBar());
   else if (tab === "settings") app.replaceChildren(shell(settingsView()), saveBar());
   else if (tab === "packages") app.replaceChildren(shell(packagesView()));
@@ -581,7 +627,9 @@ function topView() {
     h("h1", { class: "brand" }, "ports-box"),
     h("nav", { class: "tabs" }, tabs.map(tabButton)),
     lost && h("span", { class: "lost", role: "status" }, t("lost")),
-    canSignOut && h("button", { class: "plain", onclick: signOut }, t("signOut")));
+    h("div", { class: "top-end" },
+      langButton(),
+      canSignOut && iconButton("sign-out", SIGN_OUT_ICON, t("signOut"), signOut)));
 }
 
 function remoteActive() {
@@ -623,7 +671,7 @@ function accountView() {
       h("span", null, t("calibration", fmt(a.consumed), fmt(a.metered)))),
     a.migrated && !singleUser && a.unallocated > 0 && allocateView(),
     a.migrated && !singleUser && transferView(),
-    accountNotice && h("p", { class: "note " + accountNotice.kind, role: "status" }, accountNotice.text));
+    accountNotice && h("p", { class: "note " + accountNotice.kind, role: "status" }, say(accountNotice.text)));
 }
 
 function allocateView() {
@@ -656,13 +704,13 @@ async function submitAllocate(event) {
     const response = await call("POST", "allocate", body);
     if (response.ok) {
       allocateDraft.amount = "";
-      accountNotice = { kind: "ok", text: t("allocated") };
+      accountNotice = { kind: "ok", text: later("allocated") };
     } else {
       accountNotice = { kind: "error", text: await failureText(response) };
     }
   } catch (e) {
     if (e === STOP) return;
-    accountNotice = { kind: "error", text: e.message };
+    accountNotice = { kind: "error", text: reason(e) };
   }
   document.activeElement.blur();
   await refresh();
@@ -700,13 +748,13 @@ async function submitTransfer(event) {
     const response = await call("POST", "transfer", { from: transferDraft.from, to: transferDraft.to, amount });
     if (response.ok) {
       transferDraft.amount = "";
-      accountNotice = { kind: "ok", text: t("transferDone") };
+      accountNotice = { kind: "ok", text: later("transferDone") };
     } else {
       accountNotice = { kind: "error", text: await failureText(response) };
     }
   } catch (e) {
     if (e === STOP) return;
-    accountNotice = { kind: "error", text: e.message };
+    accountNotice = { kind: "error", text: reason(e) };
   }
   document.activeElement.blur();
   await refresh();
@@ -722,7 +770,7 @@ async function syncNow() {
     if (!response.ok) accountNotice = { kind: "error", text: await failureText(response) };
   } catch (e) {
     if (e === STOP) { syncing = false; return; }
-    accountNotice = { kind: "error", text: e.message };
+    accountNotice = { kind: "error", text: reason(e) };
   }
   syncing = false;
   await refresh();
@@ -817,7 +865,7 @@ function packagesView() {
     h("td", null, record.region),
     h("td", { class: "num" }, fmt(record.total)),
     h("td", { class: "num" }, fmt(record.available)),
-    h("td", null, record.expiry ? new Date(record.expiry).toLocaleDateString() : ""),
+    h("td", null, record.expiry ? new Date(record.expiry).toLocaleDateString(locale()) : ""),
     h("td", { class: record.status === "Effective" ? null : "dim" }, statusText(record.status)),
     h("td", null, creditCell(record)));
   return h("main", null,
@@ -826,7 +874,7 @@ function packagesView() {
       h("span", { class: "spent" }, syncButton())),
     a.mode !== "remote" && h("p", { class: "hint" }, t("packagesIdle")),
     a.last_error && h("p", { class: "note error" }, t("syncFailed", a.last_error)),
-    packageNotice && h("p", { class: "note " + packageNotice.kind, role: "status" }, packageNotice.text),
+    packageNotice && h("p", { class: "note " + packageNotice.kind, role: "status" }, say(packageNotice.text)),
     !a.migrated && a.mode === "remote" && h("p", { class: "hint" }, t("waiting")),
     rows.length
       ? h("div", { class: "table-wrap" }, h("table", { class: "table" }, h("thead", null, h("tr", null, head)), h("tbody", null, rows.map(row))))
@@ -861,12 +909,12 @@ async function creditPackage(id, choice) {
       revision = (await saved.json()).revision;
       source = "panel";
       const synced = await call("POST", "sync");
-      packageNotice = synced.ok ? { kind: "ok", text: t("credited") } : { kind: "error", text: await failureText(synced) };
+      packageNotice = synced.ok ? { kind: "ok", text: later("credited") } : { kind: "error", text: await failureText(synced) };
     }
     draft = null;
   } catch (e) {
     if (e === STOP) { crediting = false; return; }
-    packageNotice = { kind: "error", text: e.message };
+    packageNotice = { kind: "error", text: reason(e) };
   }
   crediting = false;
   await refresh();
@@ -1216,7 +1264,7 @@ function editView() {
 }
 
 function testView() {
-  return h("p", { class: "test-result " + (testState ? testState.kind : ""), role: "status" }, testState ? testState.text : "");
+  return h("p", { class: "test-result " + (testState ? testState.kind : ""), role: "status" }, testState ? say(testState.text) : "");
 }
 
 function renderTest() {
@@ -1237,7 +1285,7 @@ function renderRemoteSave() {
 }
 
 async function testRemote() {
-  testState = { kind: "", text: t("testing") };
+  testState = { kind: "", text: later("testing") };
   testedConnection = null;
   renderTest();
   renderRemoteSave();
@@ -1250,13 +1298,13 @@ async function testRemote() {
     if (response.ok) {
       const body = await response.json();
       testedConnection = key;
-      testState = { kind: "ok", text: t("testOk", body.packages, fmt(body.remaining)) + (body.ignored ? t("testIgnored", body.ignored) : "") };
+      testState = { kind: "ok", text: () => t("testOk", body.packages, fmt(body.remaining)) + (body.ignored ? t("testIgnored", body.ignored) : "") };
     } else {
       testState = { kind: "error", text: await failureText(response) };
     }
   } catch (e) {
     if (e === STOP) return;
-    testState = { kind: "error", text: e.message };
+    testState = { kind: "error", text: reason(e) };
   }
   renderTest();
   renderRemoteSave();
@@ -1297,7 +1345,7 @@ function settingsView() {
 function saveBar() {
   const blocked = dirty && needsTest() && !connectionTested();
   const kind = notice ? notice.kind : "";
-  const text = notice ? notice.text : blocked ? t("testFirst") : dirty ? t("unsaved") : t("clean");
+  const text = notice ? say(notice.text) : blocked ? t("testFirst") : dirty ? t("unsaved") : t("clean");
   return h("footer", { class: "savebar" }, h("div", null,
     h("p", { class: kind === "ok" ? "ok" : kind ? "error" : "", role: "status" }, text),
     kind === "conflict"
@@ -1326,7 +1374,7 @@ async function saveConfig() {
       draft.accounting.secret_key = "";
       rememberConnection();
       dirty = false;
-      notice = { kind: "ok", text: t("saved") };
+      notice = { kind: "ok", text: later("saved") };
       refresh();
       if (tab === "settings") render();
     } else {
@@ -1334,7 +1382,7 @@ async function saveConfig() {
     }
   } catch (e) {
     if (e === STOP) { saving = false; return; }
-    notice = { kind: "error", text: e.message };
+    notice = { kind: "error", text: reason(e) };
   }
   saving = false;
   renderBar();
