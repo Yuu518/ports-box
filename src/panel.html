@@ -289,6 +289,9 @@ const TEXT = {
   noneSelected: ["none", "未选择"],
   takenBy: ["given to {0}", "已分给 {0}"],
   takenSplit: ["split evenly", "已设为平分"],
+  saveRemote: ["Save", "保存"],
+  testFirst: ["Test the connection before saving the remote sync changes.", "远程同步设置有改动，请先测试连接再保存。"],
+  splitAuto: ["Single-user mode credits every package automatically.", "单用户模式下所有流量包自动入账，无需选择。"],
   noPackagesToPick: ["No uncredited packages yet; they appear here after a sync.", "暂无可选的流量包，同步后未入账的包会出现在这里。"],
   removeRule: ["Remove rule", "删除规则"],
   removeUser: ["Remove user", "删除用户"],
@@ -407,6 +410,9 @@ let loginError = false;
 let canSignOut = true;
 let singleUser = false;
 let modeError = false;
+let loadedConnection = null;
+let loadedMode = null;
+let testedConnection = null;
 let syncing = false;
 let crediting = false;
 let accountNotice = null;
@@ -833,7 +839,7 @@ async function creditPackage(id, choice) {
     dirty = false;
     notice = null;
     if (choice === "split") {
-      draft.accounting.packages = list(draft.accounting.packages).concat(id).join(", ");
+      if (!draft.accounting.packages.includes(id)) draft.accounting.packages.push(id);
     } else {
       const user = draft.users.find((user) => "user:" + user.name === choice);
       if (user && !user.packages.includes(id)) user.packages.push(id);
@@ -912,7 +918,7 @@ function toDraft(config) {
       secret_key: "",
       regions: (remote.regions || []).join(", "),
       interval_secs: String(remote.interval_secs ?? 600),
-      packages: (remote.packages || []).join(", "),
+      packages: (remote.packages || []).slice(),
     },
     users: config.users.map((user) => ({
       name: user.name,
@@ -945,7 +951,7 @@ function remoteDraft() {
     secret_key: a.secret_key,
     regions: list(a.regions),
     interval_secs: Number(a.interval_secs),
-    packages: list(a.packages),
+    packages: a.packages.slice(),
   };
 }
 
@@ -953,7 +959,7 @@ function fromDraft() {
   const a = draft.accounting;
   const accounting = { mode: a.mode, metering: a.metering };
   const remoteUsed = a.mode === "remote" || secretSet || a.secret_key
-    || a.access_key.trim() || a.regions.trim() || a.packages.trim();
+    || a.access_key.trim() || a.regions.trim() || a.packages.length;
   if (remoteUsed) accounting.remote = remoteDraft();
   return {
     revision,
@@ -993,6 +999,7 @@ async function openDraft(next, force) {
       notice = null;
       testState = null;
       modeError = false;
+      rememberConnection();
     } catch (e) {
       if (e === STOP) return;
       lost = true;
@@ -1004,11 +1011,36 @@ async function openDraft(next, force) {
   render();
 }
 
+function connectionKey() {
+  const a = draft.accounting;
+  return JSON.stringify([a.provider, a.access_key.trim(), a.secret_key, list(a.regions)]);
+}
+
+function rememberConnection() {
+  loadedConnection = connectionKey();
+  loadedMode = draft.accounting.mode;
+  testedConnection = null;
+}
+
+function connectionTested() {
+  return testedConnection === connectionKey();
+}
+
+function needsTest() {
+  if (!draft) return false;
+  return connectionKey() !== loadedConnection || (draft.accounting.mode === "remote" && loadedMode !== "remote");
+}
+
 function touch() {
-  if (dirty && !notice) return;
   dirty = true;
   notice = null;
+  if (testedConnection && !connectionTested()) {
+    testedConnection = null;
+    testState = null;
+    renderTest();
+  }
   renderBar();
+  renderRemoteSave();
 }
 
 function change(mutate) {
@@ -1061,43 +1093,43 @@ function blankRule() {
   return { listen: "", target: "", fallback: "", protocol: "both", check_secs: "10", tag: "", enabled: true };
 }
 
-function packageRows(user) {
+function packageRows(selected, owner) {
   const known = (accounting && accounting.packages) || [];
   const taken = new Map();
   for (const other of draft.users) {
-    if (other === user) continue;
+    if (other === owner) continue;
     for (const id of other.packages) taken.set(id, t("takenBy", other.name.trim() || "?"));
   }
-  for (const id of list(draft.accounting.packages)) taken.set(id, t("takenSplit"));
+  if (owner) for (const id of draft.accounting.packages) taken.set(id, t("takenSplit"));
   const rows = known
-    .filter((record) => user.packages.includes(record.id) || (!record.credit && record.status === "Effective"))
+    .filter((record) => selected.includes(record.id) || (!record.credit && record.status === "Effective"))
     .map((record) => ({
       id: record.id,
       detail: record.name + " · " + fmt(record.available),
       taken: taken.get(record.id),
     }));
-  for (const id of user.packages) {
+  for (const id of selected) {
     if (!rows.some((row) => row.id === id)) rows.push({ id, detail: "", taken: taken.get(id) });
   }
   return rows;
 }
 
-function packagePicker(user) {
+function packagePicker(label, selected, owner) {
   const summary = h("summary", null);
   const showSummary = () => {
-    summary.textContent = user.packages.length ? user.packages.join(", ") : t("noneSelected");
-    summary.className = user.packages.length ? "mono" : "empty";
+    summary.textContent = selected.length ? selected.join(", ") : t("noneSelected");
+    summary.className = selected.length ? "mono" : "empty";
   };
   showSummary();
-  const rows = packageRows(user);
+  const rows = packageRows(selected, owner);
   const option = (row) => {
-    const mine = user.packages.includes(row.id);
+    const mine = selected.includes(row.id);
     const blocked = !!row.taken && !mine;
     const box = h("input", {
       type: "checkbox", checked: mine, disabled: blocked,
       onchange: () => {
-        if (box.checked) user.packages.push(row.id);
-        else user.packages.splice(user.packages.indexOf(row.id), 1);
+        if (box.checked) selected.push(row.id);
+        else selected.splice(selected.indexOf(row.id), 1);
         showSummary();
         touch();
       },
@@ -1108,7 +1140,7 @@ function packagePicker(user) {
       h("span", { class: "dim" }, blocked ? row.taken : row.detail));
   };
   return h("div", { class: "field" },
-    h("span", null, t("userPackages")),
+    h("span", null, label),
     h("details", { class: "multi" },
       summary,
       h("div", { class: "menu" },
@@ -1120,7 +1152,7 @@ function userEditor(user) {
     h("div", { class: "form-row" },
       field(t("name"), user, "name"),
       field(t("quota"), user, "quota", { placeholder: draft.total_quota.trim() ? t("quotaPlaceholder") : t("none") }),
-      packagePicker(user),
+      packagePicker(t("userPackages"), user.packages, user),
       h("button", { class: "quiet", type: "button", onclick: () => change(() => draft.users.splice(draft.users.indexOf(user), 1)) }, t("removeUser"))),
     user.rules.map((rule) => ruleEditor(user, rule)),
     h("div", { class: "adders" },
@@ -1183,15 +1215,32 @@ function renderTest() {
   if (el) el.replaceWith(testView());
 }
 
+function remoteSaveButton() {
+  return h("button", {
+    class: "plain primary remote-save", type: "button",
+    disabled: saving || !draft || !connectionTested(), onclick: saveConfig,
+  }, saving ? t("saving") : t("saveRemote"));
+}
+
+function renderRemoteSave() {
+  const button = app.querySelector(".remote-save");
+  if (button) button.replaceWith(remoteSaveButton());
+}
+
 async function testRemote() {
   testState = { kind: "", text: t("testing") };
+  testedConnection = null;
   renderTest();
+  renderRemoteSave();
+  renderBar();
+  const key = connectionKey();
   const remote = remoteDraft();
   remote.interval_secs = remote.interval_secs || 600;
   try {
     const response = await call("POST", "remote/test", { remote });
     if (response.ok) {
       const body = await response.json();
+      testedConnection = key;
       testState = { kind: "ok", text: t("testOk", body.packages, fmt(body.remaining)) + (body.ignored ? t("testIgnored", body.ignored) : "") };
     } else {
       testState = { kind: "error", text: await failureText(response) };
@@ -1201,6 +1250,8 @@ async function testRemote() {
     testState = { kind: "error", text: e.message };
   }
   renderTest();
+  renderRemoteSave();
+  renderBar();
 }
 
 function settingsView() {
@@ -1225,22 +1276,24 @@ function settingsView() {
         field(t("secretKey"), a, "secret_key", { class: "mono", type: "password", autocomplete: "new-password", placeholder: secretSet ? t("secretKept") : "" }),
         field(t("regions"), a, "regions", { class: "mono", placeholder: t("regionsPlaceholder") }),
         field(t("interval"), a, "interval_secs", { type: "number", min: "60" }),
-        field(t("splitPackages"), a, "packages", { class: "mono", placeholder: t("fallbackPlaceholder") })),
+        draft.single_user ? h("div", { class: "field" }, h("span", null, t("splitPackages")), h("p", { class: "hint" }, t("splitAuto"))) : packagePicker(t("splitPackages"), a.packages, null)),
       h("p", { class: "hint" }, t("remoteHint")),
       h("div", { class: "adders" },
         h("button", { class: "plain", type: "button", onclick: testRemote }, t("test")),
+        remoteSaveButton(),
         testView())));
 }
 
 function saveBar() {
+  const blocked = dirty && needsTest() && !connectionTested();
   const kind = notice ? notice.kind : "";
-  const text = notice ? notice.text : dirty ? t("unsaved") : t("clean");
+  const text = notice ? notice.text : blocked ? t("testFirst") : dirty ? t("unsaved") : t("clean");
   return h("footer", { class: "savebar" }, h("div", null,
     h("p", { class: kind === "ok" ? "ok" : kind ? "error" : "", role: "status" }, text),
     kind === "conflict"
       ? h("button", { class: "plain", onclick: () => openDraft(tab, true) }, t("reload"))
       : h("button", { class: "plain", disabled: !dirty || saving, onclick: () => openDraft(tab, true) }, t("discard")),
-    h("button", { class: "plain primary", disabled: !dirty || saving, onclick: saveConfig }, saving ? t("saving") : t("save"))));
+    h("button", { class: "plain primary", disabled: !dirty || saving || blocked, onclick: saveConfig }, saving ? t("saving") : t("save"))));
 }
 
 function renderBar() {
@@ -1252,6 +1305,7 @@ async function saveConfig() {
   saving = true;
   notice = null;
   renderBar();
+  renderRemoteSave();
   try {
     const response = await call("PUT", "config", fromDraft());
     if (response.ok) {
@@ -1260,6 +1314,7 @@ async function saveConfig() {
       source = "panel";
       secretSet = secretSet || !!draft.accounting.secret_key;
       draft.accounting.secret_key = "";
+      rememberConnection();
       dirty = false;
       notice = { kind: "ok", text: t("saved") };
       if (tab === "settings") render();
@@ -1272,6 +1327,7 @@ async function saveConfig() {
   }
   saving = false;
   renderBar();
+  renderRemoteSave();
 }
 
 addEventListener("beforeunload", (event) => { if (dirty) event.preventDefault(); });
