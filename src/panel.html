@@ -186,6 +186,29 @@ button, input, select { font: inherit; color: inherit; }
 .plus { color: var(--live); }
 .minus { color: var(--down); }
 .credit { display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; }
+.multi { position: relative; }
+.multi summary {
+  list-style: none; cursor: pointer; position: relative; min-height: 2.15rem;
+  background: var(--surface); border: 1px solid var(--line); border-radius: 0.35rem;
+  padding: 0.35rem 1.6rem 0.35rem 0.5rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.multi summary::-webkit-details-marker { display: none; }
+.multi summary::after { content: "▾"; position: absolute; right: 0.55rem; top: 0.35rem; color: var(--muted); }
+.multi summary:hover { border-color: var(--muted); }
+.multi summary.empty { color: var(--muted); }
+.multi .menu {
+  position: absolute; z-index: 5; top: calc(100% + 0.25rem); left: 0;
+  min-width: 100%; width: max-content; max-width: min(30rem, 90vw);
+  background: var(--surface); border: 1px solid var(--line); border-radius: 0.4rem;
+  padding: 0.3rem; box-shadow: 0 8px 24px rgb(0 0 0 / 0.14);
+}
+.multi .option { display: flex; align-items: center; gap: 0.5rem; padding: 0.35rem 0.45rem; border-radius: 0.3rem; cursor: pointer; }
+.multi .option:hover { background: var(--sunk); }
+.multi .option.taken { cursor: default; opacity: 0.55; }
+.multi .option input { accent-color: var(--live); margin: 0; width: auto; flex: none; padding: 0; }
+.multi .option span { white-space: nowrap; }
+.multi .option .dim { color: var(--muted); font-size: 0.88rem; }
+.multi .menu .hint { margin: 0.25rem 0.45rem; }
 .credit select, .filter select {
   background: var(--surface); border: 1px solid var(--line); border-radius: 0.35rem; padding: 0.3rem 0.45rem;
 }
@@ -263,6 +286,10 @@ const TEXT = {
   singleHint: ["All rules share one implicit user, so the total quota or traffic packages cover the whole server. Same as writing top-level rules in the config file.", "所有规则归属同一个隐含用户，总配额或流量包作用于整台机器，等同于在配置文件顶层写 rules。"],
   singleTooMany: ["Keep only one user before switching to single-user mode.", "切换到单用户模式前，请先只保留一个用户。"],
   noRulesYet: ["No rules yet.", "还没有规则。"],
+  noneSelected: ["none", "未选择"],
+  takenBy: ["given to {0}", "已分给 {0}"],
+  takenSplit: ["split evenly", "已设为平分"],
+  noPackagesToPick: ["No uncredited packages yet; they appear here after a sync.", "暂无可选的流量包，同步后未入账的包会出现在这里。"],
   removeRule: ["Remove rule", "删除规则"],
   removeUser: ["Remove user", "删除用户"],
   save: ["Save changes", "保存更改"],
@@ -391,7 +418,7 @@ const packageChoice = {};
 
 function h(tag, props, ...kids) {
   const el = document.createElement(tag);
-  for (const kid of kids.flat()) if (kid != null && kid !== false) el.append(kid);
+  for (const kid of kids.flat(Infinity)) if (kid != null && kid !== false) el.append(kid);
   for (const [key, value] of Object.entries(props || {})) {
     if (key.startsWith("on")) el.addEventListener(key.slice(2), value);
     else if (key === "class") el.className = value;
@@ -809,7 +836,7 @@ async function creditPackage(id, choice) {
       draft.accounting.packages = list(draft.accounting.packages).concat(id).join(", ");
     } else {
       const user = draft.users.find((user) => "user:" + user.name === choice);
-      if (user) user.packages = list(user.packages).concat(id).join(", ");
+      if (user && !user.packages.includes(id)) user.packages.push(id);
     }
     const saved = await call("PUT", "config", fromDraft());
     if (!saved.ok) {
@@ -890,7 +917,7 @@ function toDraft(config) {
     users: config.users.map((user) => ({
       name: user.name,
       quota: String(user.quota ?? ""),
-      packages: (user.packages || []).join(", "),
+      packages: (user.packages || []).slice(),
       rules: user.rules.map((rule) => ({
         listen: rule.listen,
         target: rule.target,
@@ -936,7 +963,7 @@ function fromDraft() {
     users: draft.users.map((user) => ({
       name: user.name.trim(),
       quota: size(user.quota),
-      packages: list(user.packages),
+      packages: user.packages.slice(),
       rules: user.rules.map((rule) => {
         const out = {
           listen: rule.listen.trim(),
@@ -1034,12 +1061,66 @@ function blankRule() {
   return { listen: "", target: "", fallback: "", protocol: "both", check_secs: "10", tag: "", enabled: true };
 }
 
+function packageRows(user) {
+  const known = (accounting && accounting.packages) || [];
+  const taken = new Map();
+  for (const other of draft.users) {
+    if (other === user) continue;
+    for (const id of other.packages) taken.set(id, t("takenBy", other.name.trim() || "?"));
+  }
+  for (const id of list(draft.accounting.packages)) taken.set(id, t("takenSplit"));
+  const rows = known
+    .filter((record) => user.packages.includes(record.id) || (!record.credit && record.status === "Effective"))
+    .map((record) => ({
+      id: record.id,
+      detail: record.name + " · " + fmt(record.available),
+      taken: taken.get(record.id),
+    }));
+  for (const id of user.packages) {
+    if (!rows.some((row) => row.id === id)) rows.push({ id, detail: "", taken: taken.get(id) });
+  }
+  return rows;
+}
+
+function packagePicker(user) {
+  const summary = h("summary", null);
+  const showSummary = () => {
+    summary.textContent = user.packages.length ? user.packages.join(", ") : t("noneSelected");
+    summary.className = user.packages.length ? "mono" : "empty";
+  };
+  showSummary();
+  const rows = packageRows(user);
+  const option = (row) => {
+    const mine = user.packages.includes(row.id);
+    const blocked = !!row.taken && !mine;
+    const box = h("input", {
+      type: "checkbox", checked: mine, disabled: blocked,
+      onchange: () => {
+        if (box.checked) user.packages.push(row.id);
+        else user.packages.splice(user.packages.indexOf(row.id), 1);
+        showSummary();
+        touch();
+      },
+    });
+    return h("label", { class: "option" + (blocked ? " taken" : "") },
+      box,
+      h("span", { class: "mono" }, row.id),
+      h("span", { class: "dim" }, blocked ? row.taken : row.detail));
+  };
+  return h("div", { class: "field" },
+    h("span", null, t("userPackages")),
+    h("details", { class: "multi" },
+      summary,
+      h("div", { class: "menu" },
+        rows.length ? rows.map(option) : h("p", { class: "hint" }, t("noPackagesToPick")))));
+}
+
 function userEditor(user) {
   return h("section", { class: "edit-user" },
     h("div", { class: "form-row" },
       field(t("name"), user, "name"),
       field(t("quota"), user, "quota", { placeholder: draft.total_quota.trim() ? t("quotaPlaceholder") : t("none") }),
-      field(t("userPackages"), user, "packages", { class: "mono", placeholder: t("fallbackPlaceholder") }),
+      packagePicker(user),
       h("button", { class: "quiet", type: "button", onclick: () => change(() => draft.users.splice(draft.users.indexOf(user), 1)) }, t("removeUser"))),
     user.rules.map((rule) => ruleEditor(user, rule)),
     h("div", { class: "adders" },
@@ -1049,7 +1130,7 @@ function userEditor(user) {
 function singleEditor() {
   const user = draft.users[0];
   const add = () => change(() => {
-    if (!draft.users.length) draft.users.push({ name: "default", quota: "", packages: "", rules: [] });
+    if (!draft.users.length) draft.users.push({ name: "default", quota: "", packages: [], rules: [] });
     draft.users[0].rules.push(blankRule());
   });
   return h("section", { class: "edit-user single" },
@@ -1089,7 +1170,7 @@ function editView() {
       : [
         draft.users.map(userEditor),
         h("div", { class: "adders" },
-          h("button", { class: "plain", type: "button", onclick: () => change(() => draft.users.push({ name: "", quota: "", packages: "", rules: [] })) }, t("addUser"))),
+          h("button", { class: "plain", type: "button", onclick: () => change(() => draft.users.push({ name: "", quota: "", packages: [], rules: [] })) }, t("addUser"))),
       ]);
 }
 
@@ -1194,6 +1275,11 @@ async function saveConfig() {
 }
 
 addEventListener("beforeunload", (event) => { if (dirty) event.preventDefault(); });
+document.addEventListener("click", (event) => {
+  for (const open of document.querySelectorAll("details.multi[open]")) {
+    if (!open.contains(event.target)) open.open = false;
+  }
+});
 setInterval(() => { if (screen === "main" && !document.hidden) refresh(); }, 3000);
 document.documentElement.lang = zh ? "zh" : "en";
 render();
