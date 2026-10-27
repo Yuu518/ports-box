@@ -48,6 +48,8 @@ pub struct Store {
     pub total_quota: Option<ByteSize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accounting: Option<Accounting>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub single_user: Option<bool>,
     pub users: Vec<UserConfig>,
 }
 
@@ -107,6 +109,8 @@ pub struct ConfigEdit {
     pub total_quota: Option<ByteSize>,
     #[serde(default)]
     pub accounting: Option<Accounting>,
+    #[serde(default)]
+    pub single_user: bool,
     pub users: Vec<UserConfig>,
 }
 
@@ -230,6 +234,7 @@ struct ConfigView<'a> {
     total_quota: Option<ByteSize>,
     accounting: Accounting,
     secret_key_set: bool,
+    single_user: bool,
     users: &'a [UserConfig],
 }
 
@@ -461,8 +466,13 @@ async fn status(State(state): State<PanelState>) -> Response {
         .collect();
     let can_sign_out = state.credentials.has_token() || state.credentials.has_login();
     let accounting = state.accounting.borrow().clone();
-    Json(json!({ "users": users, "accounting": *accounting, "can_sign_out": can_sign_out }))
-        .into_response()
+    Json(json!({
+        "users": users,
+        "single_user": live.config.single_user,
+        "accounting": *accounting,
+        "can_sign_out": can_sign_out,
+    }))
+    .into_response()
 }
 
 async fn get_config(State(state): State<PanelState>) -> Response {
@@ -478,6 +488,7 @@ async fn get_config(State(state): State<PanelState>) -> Response {
         total_quota: live.config.total_quota,
         accounting,
         secret_key_set,
+        single_user: live.config.single_user,
         users: &live.config.users,
     })
     .into_response()
@@ -622,6 +633,7 @@ mod tests {
                 mode: Mode::Remote,
                 ..Default::default()
             }),
+            single_user: Some(true),
             users,
         };
         write_store(&path, &store).await.unwrap();
@@ -982,7 +994,7 @@ mod tests {
         assert!(accounting.get("entries").is_none());
         assert_eq!(
             body,
-            json!({"can_sign_out": true, "users": [{
+            json!({"can_sign_out": true, "single_user": false, "users": [{
                 "name": "alice",
                 "total": "1000B",
                 "used": "200B",
@@ -1017,6 +1029,7 @@ mod tests {
         }
         let json: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(json["secret_key_set"], true);
+        assert_eq!(json["single_user"], false);
         assert_eq!(json["accounting"]["remote"]["access_key"], "AKID");
         assert_eq!(json["accounting"]["remote"]["secret_key"], "");
         assert_eq!(json["accounting"]["mode"], "offline");
@@ -1036,6 +1049,7 @@ mod tests {
                 let result = match request.edit.revision {
                     7 => {
                         assert_eq!(request.edit.total_quota, Some(ByteSize(2 << 30)));
+                        assert!(request.edit.single_user);
                         assert_eq!(request.edit.users[0].rules[0].target, "x:1");
                         Ok(8)
                     }
@@ -1050,6 +1064,7 @@ mod tests {
             json!({
                 "revision": revision,
                 "total_quota": "2GB",
+                "single_user": true,
                 "users": [{"name": "a", "quota": null, "rules": [{"listen": "0.0.0.0:1", "target": "x:1"}]}]
             })
         };

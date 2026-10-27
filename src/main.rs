@@ -307,6 +307,7 @@ fn restore(file: &Config, raw: &str, path: &Path) -> Option<Config> {
     let edited = Config {
         total_quota: store.total_quota,
         accounting: store.accounting.unwrap_or_else(|| file.accounting.clone()),
+        single_user: store.single_user.unwrap_or(file.single_user),
         users: store.users,
         ..file.clone()
     };
@@ -382,11 +383,13 @@ async fn save(
         base: file_raw.to_owned(),
         total_quota: edit.total_quota,
         accounting: Some(accounting),
+        single_user: Some(edit.single_user),
         users: edit.users,
     };
     let next = config::check(Config {
         total_quota: store.total_quota,
         accounting: store.accounting.clone().unwrap_or_default(),
+        single_user: edit.single_user,
         users: store.users.clone(),
         ..current.config.clone()
     })

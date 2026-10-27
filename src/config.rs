@@ -24,6 +24,8 @@ pub struct Config {
     pub rules: Vec<Rule>,
     #[serde(default)]
     pub users: Vec<UserConfig>,
+    #[serde(skip)]
+    pub single_user: bool,
 }
 
 impl Config {
@@ -429,6 +431,7 @@ fn finalize(mut config: Config) -> Result<Config, String> {
             packages: Vec::new(),
             rules: std::mem::take(&mut config.rules),
         });
+        config.single_user = true;
     }
     validate(&config)?;
     Ok(config)
@@ -437,6 +440,9 @@ fn finalize(mut config: Config) -> Result<Config, String> {
 fn validate(config: &Config) -> Result<(), String> {
     if config.users.is_empty() && config.panel().is_none() {
         return Err("config has no users or rules; add some or enable the panel".into());
+    }
+    if config.single_user && config.users.len() > 1 {
+        return Err("single-user mode allows only one user".into());
     }
     if let Some(state) = &config.state_file
         && state.flush_secs == 0
@@ -800,6 +806,7 @@ mod tests {
         assert_eq!(config.users.len(), 1);
         assert_eq!(config.users[0].name, "default");
         assert_eq!(config.users[0].rules.len(), 1);
+        assert!(config.single_user);
         // Without quota/total_quota the implicit user is unlimited.
         assert_eq!(resolve_quotas(&config)["default"], None);
 
@@ -1122,6 +1129,29 @@ users:
         })
         .unwrap_err();
         assert!(err.contains("no users or rules"), "{err}");
+    }
+
+    #[test]
+    fn single_user_mode_holds_one_user() {
+        let config = parse_config(
+            r#"{"users": [{"name": "a", "rules": [{"listen": "0.0.0.0:1", "target": "x:1"}]}]}"#,
+        )
+        .unwrap();
+        assert!(!config.single_user);
+        let users = config.users.clone();
+        let single = check(Config {
+            single_user: true,
+            ..config.clone()
+        })
+        .unwrap();
+        assert!(single.single_user);
+        let err = check(Config {
+            single_user: true,
+            users: [users.clone(), users].concat(),
+            ..config
+        })
+        .unwrap_err();
+        assert!(err.contains("only one user"), "{err}");
     }
 
     #[test]

@@ -142,6 +142,7 @@ button, input, select { font: inherit; color: inherit; }
 .edit-rule .on span { font-size: 0.82rem; color: var(--muted); }
 .edit-rule .on input { width: 1.1rem; height: 1.1rem; margin: 0.45rem 0; accent-color: var(--live); }
 .adders { display: flex; gap: 0.5rem; margin-top: 1rem; }
+.edit-user.single > .edit-rule:first-child { margin-top: 0; padding-top: 0; border-top: 0; }
 .savebar {
   position: fixed; left: 0; right: 0; bottom: 0; background: var(--surface);
   border-top: 1px solid var(--line); padding: 0.75rem 1.25rem;
@@ -255,6 +256,13 @@ const TEXT = {
   check: ["Check, s", "检查间隔(秒)"],
   addRule: ["Add rule", "添加规则"],
   addUser: ["Add user", "添加用户"],
+  userMode: ["Mode", "模式"],
+  modeMulti: ["Multiple users", "多用户"],
+  modeSingle: ["Single user (exclusive)", "单用户（独享）"],
+  multiHint: ["Each user has their own rules and their own quota or balance.", "每个用户有自己的规则，以及各自的配额或余额。"],
+  singleHint: ["All rules share one implicit user, so the total quota or traffic packages cover the whole server. Same as writing top-level rules in the config file.", "所有规则归属同一个隐含用户，总配额或流量包作用于整台机器，等同于在配置文件顶层写 rules。"],
+  singleTooMany: ["Keep only one user before switching to single-user mode.", "切换到单用户模式前，请先只保留一个用户。"],
+  noRulesYet: ["No rules yet.", "还没有规则。"],
   removeRule: ["Remove rule", "删除规则"],
   removeUser: ["Remove user", "删除用户"],
   save: ["Save changes", "保存更改"],
@@ -365,6 +373,8 @@ let saving = false;
 let notice = null;
 let loginError = false;
 let canSignOut = true;
+let singleUser = false;
+let modeError = false;
 let syncing = false;
 let crediting = false;
 let accountNotice = null;
@@ -443,6 +453,7 @@ async function refresh() {
     users = body.users;
     accounting = body.accounting;
     canSignOut = body.can_sign_out;
+    singleUser = body.single_user;
     lost = false;
   } catch (e) {
     if (e === STOP) return;
@@ -635,7 +646,7 @@ function userView(user) {
     : limited ? t("usedOf", user.used, user.total) : t("usedOnly", user.used);
   return h("section", { class: "user" },
     h("div", { class: "user-head" },
-      h("h2", { class: "user-name" }, user.name),
+      !(singleUser && users.length === 1) && h("h2", { class: "user-name" }, user.name),
       user.exhausted && h("span", { class: "flag" }, t(remote ? "noBalance" : "exhausted")),
       h("span", { class: "spent" }, spent)),
     limited && !remote && h("div", { class: "meter" + level, role: "img", "aria-label": Math.round(share * 100) + "%" },
@@ -686,7 +697,7 @@ function creditCell(record) {
   if (record.credit) return creditText(record.credit);
   if (record.status !== "Effective") return h("span", { class: "dim" }, t("creditNone"));
   const options = [["split", t("splitAll")]]
-    .concat((users || []).map((user) => ["user:" + user.name, t("giveTo", user.name)]));
+    .concat(singleUser ? [] : (users || []).map((user) => ["user:" + user.name, t("giveTo", user.name)]));
   if (!options.some(([value]) => value === packageChoice[record.id])) packageChoice[record.id] = "split";
   const select = h("select", {
     value: packageChoice[record.id],
@@ -815,6 +826,7 @@ function toDraft(config) {
   const remote = accounting.remote || {};
   return {
     total_quota: String(config.total_quota ?? ""),
+    single_user: !!config.single_user,
     accounting: {
       mode: accounting.mode || "offline",
       metering: accounting.metering || "max",
@@ -870,6 +882,7 @@ function fromDraft() {
     revision,
     total_quota: size(draft.total_quota),
     accounting,
+    single_user: draft.single_user,
     users: draft.users.map((user) => ({
       name: user.name.trim(),
       quota: size(user.quota),
@@ -902,6 +915,7 @@ async function openDraft(next, force) {
       dirty = false;
       notice = null;
       testState = null;
+      modeError = false;
     } catch (e) {
       if (e === STOP) return;
       lost = true;
@@ -966,8 +980,11 @@ function ruleEditor(user, rule) {
     h("button", { class: "quiet", type: "button", onclick: remove }, t("removeRule")));
 }
 
+function blankRule() {
+  return { listen: "", target: "", fallback: "", protocol: "both", check_secs: "10", tag: "", enabled: true };
+}
+
 function userEditor(user) {
-  const blank = { listen: "", target: "", fallback: "", protocol: "both", check_secs: "10", tag: "", enabled: true };
   return h("section", { class: "edit-user" },
     h("div", { class: "form-row" },
       field(t("name"), user, "name"),
@@ -976,15 +993,54 @@ function userEditor(user) {
       h("button", { class: "quiet", type: "button", onclick: () => change(() => draft.users.splice(draft.users.indexOf(user), 1)) }, t("removeUser"))),
     user.rules.map((rule) => ruleEditor(user, rule)),
     h("div", { class: "adders" },
-      h("button", { class: "plain", type: "button", onclick: () => change(() => user.rules.push(Object.assign({}, blank))) }, t("addRule"))));
+      h("button", { class: "plain", type: "button", onclick: () => change(() => user.rules.push(blankRule())) }, t("addRule"))));
+}
+
+function singleEditor() {
+  const user = draft.users[0];
+  const add = () => change(() => {
+    if (!draft.users.length) draft.users.push({ name: "default", quota: "", packages: "", rules: [] });
+    draft.users[0].rules.push(blankRule());
+  });
+  return h("section", { class: "edit-user single" },
+    user && user.rules.length
+      ? user.rules.map((rule) => ruleEditor(user, rule))
+      : h("p", { class: "empty" }, t("noRulesYet")),
+    h("div", { class: "adders" },
+      h("button", { class: "plain", type: "button", onclick: add }, t("addRule"))));
+}
+
+function modeView() {
+  const select = h("select", {
+    value: draft.single_user ? "single" : "multi",
+    onchange: () => {
+      const single = select.value === "single";
+      if (single && draft.users.length > 1) {
+        modeError = true;
+        render();
+        return;
+      }
+      modeError = false;
+      change(() => { draft.single_user = single; });
+    },
+  }, [["multi", t("modeMulti")], ["single", t("modeSingle")]].map(([value, text]) => h("option", { value }, text)));
+  return h("section", { class: "totals" },
+    h("div", { class: "form-row" }, h("label", { class: "field" }, h("span", null, t("userMode")), select)),
+    h("p", { class: "hint" }, t(draft.single_user ? "singleHint" : "multiHint")),
+    modeError && h("p", { class: "note error", role: "alert" }, t("singleTooMany")));
 }
 
 function editView() {
   return h("main", null,
     h("p", { class: "source" }, t(source === "panel" ? "fromPanel" : "fromFile")),
-    draft.users.map(userEditor),
-    h("div", { class: "adders" },
-      h("button", { class: "plain", type: "button", onclick: () => change(() => draft.users.push({ name: "", quota: "", packages: "", rules: [] })) }, t("addUser"))));
+    modeView(),
+    draft.single_user
+      ? singleEditor()
+      : [
+        draft.users.map(userEditor),
+        h("div", { class: "adders" },
+          h("button", { class: "plain", type: "button", onclick: () => change(() => draft.users.push({ name: "", quota: "", packages: "", rules: [] })) }, t("addUser"))),
+      ]);
 }
 
 function testView() {
