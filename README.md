@@ -274,12 +274,14 @@ Offline accounting compares lifetime usage with a fixed `total_quota`. When the 
 
 How a sync works:
 
-- **First sync (migration).** Every package that exists at that moment is marked as already counted, and each user's opening balance is their offline remaining traffic scaled so that the balances add up to the provider's remaining traffic. Until the first sync succeeds, offline limits stay in effect.
+- **First sync (migration).** Every package that exists at that moment is marked as already counted, and each user's opening balance is their offline remaining traffic scaled so that the balances add up to the provider's remaining traffic. Migration waits until at least one user exists; until the first sync succeeds, offline limits stay in effect.
 - **New packages are credited once, only if listed.** A package listed under `remote.packages` is split evenly among the current users; a package listed under a user's `packages` goes to that user in full. Unlisted packages are shown as unallocated until you list them. Listing a package again, moving it, or removing it after it was credited changes nothing; transfer balances instead.
+- **Single-user mode needs no lists.** With top-level `rules` (or single-user mode in the panel), every package in the configured regions is credited to the one user automatically, and every sync settles any difference into that user, so the balance always equals the provider's remaining traffic.
 - **Consumption is calibrated.** The drop in the provider's remaining traffic since the last sync is charged to users in proportion to the traffic ports-box metered for each of them, so the balances keep adding up to the console. If nothing was metered, the drop is not charged and shows up as negative unallocated traffic.
 - **Expired leftovers are forfeited by balance.** The provider drains packages in expiry order across the whole region, so a package's leftover at expiry cannot be traced to a user; it is taken from users in proportion to their balances.
 - **Limits between syncs.** Each user may use their balance as of the last sync; local metering stops them in real time, and the next sync corrects the difference. A user with no balance (for example one just added) is stopped until they receive some.
 - **Transfers.** The panel moves balance between users; a user can only give what they have left.
+- **Allocating unallocated traffic.** When the provider holds more than the balances add up to (an unlisted package, or a user added after migration), the overview offers to split the unallocated traffic among all users or give it to one, in full or in part.
 
 Balances, package snapshots, and a ledger of every credit, transfer, and forfeit are kept in `state_file`. Without it they live in memory and the next start migrates again. Switching back to `offline` uses `total_quota` and `quota` again; the ledger is kept and resumes when remote mode is turned back on.
 

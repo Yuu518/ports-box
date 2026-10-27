@@ -290,6 +290,10 @@ const TEXT = {
   to: ["To", "转入"],
   amount: ["Amount", "数量"],
   transferDone: ["Transferred.", "转账完成。"],
+  allocateTo: ["Give unallocated to", "未分配流量分给"],
+  allocate: ["Allocate", "分配"],
+  allocateAll: ["all", "全部"],
+  allocated: ["Allocated.", "已分配。"],
   packagesOff: ["Traffic packages appear here once remote sync is set up under Settings.", "在“设置”中配置远程同步后，这里会列出流量包。"],
   packagesIdle: ["Remote sync is configured but accounting is offline, so nothing is synced.", "已配置远程同步，但统计方式为离线，不会同步。"],
   noPackages: ["No traffic packages in {0}.", "{0} 没有流量包。"],
@@ -328,6 +332,7 @@ const TEXT = {
   kindCredit: ["Package credited", "流量包入账"],
   kindExpiry: ["Expired leftover", "到期清零"],
   kindTransfer: ["Transfer", "转账"],
+  kindAllocate: ["Allocated", "分配未分配流量"],
   transferTo: ["to {0}", "转给 {0}"],
   transferFrom: ["from {0}", "来自 {0}"],
   modeLabel: ["Accounting", "统计方式"],
@@ -381,6 +386,7 @@ let accountNotice = null;
 let packageNotice = null;
 let testState = null;
 const transferDraft = { from: "", to: "", amount: "" };
+const allocateDraft = { to: "", amount: "" };
 const packageChoice = {};
 
 function h(tag, props, ...kids) {
@@ -573,8 +579,52 @@ function accountView() {
         h("span", null, t("unallocated"), " ", h("b", null, signed(a.unallocated))),
         h("span", null, t("calibration", fmt(a.consumed), fmt(a.metered))))
       : h("p", { class: "hint" }, t("waiting")),
+    a.migrated && a.unallocated > 0 && allocateView(),
     a.migrated && transferView(),
     accountNotice && h("p", { class: "note " + accountNotice.kind, role: "status" }, accountNotice.text));
+}
+
+function allocateView() {
+  const names = (users || []).map((user) => user.name);
+  if (!names.length) return null;
+  const options = (names.length > 1 ? [["", t("splitAll")]] : [])
+    .concat(names.map((name) => [name, t("giveTo", name)]));
+  if (!options.some(([value]) => value === allocateDraft.to)) allocateDraft.to = options[0][0];
+  const select = h("select", {
+    value: allocateDraft.to,
+    onchange: () => { allocateDraft.to = select.value; },
+  }, options.map(([value, text]) => h("option", { value }, text)));
+  const amount = h("input", {
+    value: allocateDraft.amount, placeholder: t("allocateAll"), spellcheck: "false", autocomplete: "off",
+    oninput: () => { allocateDraft.amount = amount.value; },
+  });
+  return h("form", { class: "form-row transfer", onsubmit: submitAllocate },
+    h("label", { class: "field" }, h("span", null, t("allocateTo")), select),
+    h("label", { class: "field" }, h("span", null, t("amount")), amount),
+    h("button", { class: "plain" }, t("allocate")));
+}
+
+async function submitAllocate(event) {
+  event.preventDefault();
+  const body = {};
+  if (allocateDraft.to) body.to = allocateDraft.to;
+  const amount = size(allocateDraft.amount);
+  if (amount != null) body.amount = amount;
+  try {
+    const response = await call("POST", "allocate", body);
+    if (response.ok) {
+      allocateDraft.amount = "";
+      accountNotice = { kind: "ok", text: t("allocated") };
+    } else {
+      accountNotice = { kind: "error", text: await failureText(response) };
+    }
+  } catch (e) {
+    if (e === STOP) return;
+    accountNotice = { kind: "error", text: e.message };
+  }
+  document.activeElement.blur();
+  await refresh();
+  render();
 }
 
 function transferView() {

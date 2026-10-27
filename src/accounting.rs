@@ -58,6 +58,11 @@ pub enum Command {
         amount: u64,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    Allocate {
+        to: Option<String>,
+        amount: Option<u64>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -104,12 +109,14 @@ pub fn assignments(config: &Config) -> Assignments {
                     .map(|id| (id.clone(), user.name.clone()))
             })
             .collect(),
+        exclusive: config.single_user,
     }
 }
 
 #[derive(PartialEq)]
 struct Watched {
     accounting: Accounting,
+    single_user: bool,
     owners: Vec<(String, Vec<String>)>,
 }
 
@@ -117,6 +124,7 @@ impl Watched {
     fn of(config: &Config) -> Self {
         Self {
             accounting: config.accounting.clone(),
+            single_user: config.single_user,
             owners: config
                 .users
                 .iter()
@@ -276,6 +284,9 @@ impl Engine {
     }
 
     async fn sync_with(&mut self, config: &Config, remote: &RemoteConfig) -> Result<(), String> {
+        if !self.book.migrated && self.members(config).is_empty() {
+            return Err("waiting for a user before remote accounting can start".into());
+        }
         let fetched = (self.fetch)(remote.clone()).await?;
         if fetched.ignored != self.ignored && !fetched.ignored.is_empty() {
             info!(
@@ -314,6 +325,23 @@ impl Engine {
         let entries = book.transfer(&members, from, to, amount, unix_now())?;
         self.commit(book, entries).await?;
         info!("transferred {} from {from} to {to}", format_size(amount));
+        self.apply_limits(&config);
+        self.publish();
+        Ok(())
+    }
+
+    async fn allocate(&mut self, to: Option<&str>, amount: Option<u64>) -> Result<(), String> {
+        let config = self.config();
+        let members = self.members(&config);
+        let mut book = self.book.clone();
+        let entries = book.allocate(&members, to, amount, unix_now())?;
+        let total: i64 = entries.iter().map(|entry| entry.amount).sum();
+        self.commit(book, entries).await?;
+        info!(
+            "allocated {} of unallocated traffic to {}",
+            format_size(total.max(0) as u64),
+            to.unwrap_or("all users")
+        );
         self.apply_limits(&config);
         self.publish();
         Ok(())
@@ -370,6 +398,9 @@ impl Engine {
                     }
                     Some(Command::Transfer { from, to, amount, reply }) => {
                         let _ = reply.send(self.transfer(&from, &to, amount).await);
+                    }
+                    Some(Command::Allocate { to, amount, reply }) => {
+                        let _ = reply.send(self.allocate(to.as_deref(), amount).await);
                     }
                     None => return,
                 },
@@ -544,6 +575,45 @@ mod tests {
         assert_eq!(status.packages.len(), 1);
         assert_eq!(status.ignored.len(), 1);
         assert_eq!(status.last_error, None);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn migration_waits_for_a_user() {
+        let live = live(
+            r#"{
+                "panel": {"enabled": true},
+                "accounting": {"mode": "remote", "remote": {"provider": "volcengine", "access_key": "ak", "secret_key": "sk", "regions": ["cn-shanghai"]}}
+            }"#,
+        );
+        let users = watch::Sender::new(Arc::new(UserSet::default()));
+        let fetched = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let engine = Engine::new(
+            None,
+            live.subscribe(),
+            users.subscribe(),
+            RemoteLimits::new(&Book::default()),
+            Book::default(),
+            Vec::new(),
+        )
+        .with_fetch({
+            let fetched = fetched.clone();
+            Arc::new(move |_| {
+                fetched.store(true, std::sync::atomic::Ordering::Relaxed);
+                Box::pin(async { Err("fetched".into()) })
+            })
+        });
+        let status = engine.status();
+        let (commands, rx) = mpsc::channel(1);
+        let task = tokio::spawn(engine.run(rx));
+
+        let (reply, result) = oneshot::channel();
+        commands.send(Command::Sync(reply)).await.ok().unwrap();
+        let err = result.await.unwrap().unwrap_err();
+
+        assert!(err.contains("waiting for a user"), "{err}");
+        assert!(!fetched.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!status.borrow().migrated);
         task.abort();
     }
 

@@ -254,6 +254,15 @@ struct Transfer {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct Allocate {
+    #[serde(default)]
+    to: Option<String>,
+    #[serde(default)]
+    amount: Option<ByteSize>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RemoteTest {
     remote: RemoteConfig,
 }
@@ -286,6 +295,7 @@ fn router_with_clock(
         .route("/dashboard/api/ledger", get(ledger))
         .route("/dashboard/api/sync", post(sync))
         .route("/dashboard/api/transfer", post(transfer))
+        .route("/dashboard/api/allocate", post(allocate))
         .route("/dashboard/api/remote/test", post(test_remote))
         .route_layer(middleware::from_fn_with_state(state.clone(), guard));
     Router::new()
@@ -534,6 +544,22 @@ async fn transfer(
         from,
         to,
         amount: amount.0,
+        reply,
+    })
+    .await
+}
+
+async fn allocate(
+    State(state): State<PanelState>,
+    body: Result<Json<Allocate>, JsonRejection>,
+) -> Response {
+    let Allocate { to, amount } = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => return failure(StatusCode::BAD_REQUEST, rejection.body_text()),
+    };
+    command(&state, |reply| Command::Allocate {
+        to,
+        amount: amount.map(|amount| amount.0),
         reply,
     })
     .await
@@ -818,6 +844,7 @@ mod tests {
             ("GET", "/dashboard/api/ledger", None),
             ("POST", "/dashboard/api/sync", None),
             ("POST", "/dashboard/api/transfer", Some(json!({}))),
+            ("POST", "/dashboard/api/allocate", Some(json!({}))),
             ("POST", "/dashboard/api/remote/test", Some(json!({}))),
             ("POST", LOGIN, Some(login)),
             ("POST", LOGOUT, None),
@@ -852,6 +879,7 @@ mod tests {
             ("GET", "/dashboard/api/ledger"),
             ("POST", "/dashboard/api/sync"),
             ("POST", "/dashboard/api/transfer"),
+            ("POST", "/dashboard/api/allocate"),
             ("POST", "/dashboard/api/remote/test"),
         ] {
             let response = send(&app, method, uri, Some(&gate), None).await;
@@ -1121,6 +1149,14 @@ mod tests {
                         assert_eq!(amount, 5 << 30);
                         let _ = reply.send(Ok(()));
                     }
+                    Command::Allocate { to, amount, reply } => {
+                        let result = match (to.as_deref(), amount) {
+                            (None, None) => Ok(()),
+                            (Some("alice"), Some(1024)) => Err("nothing is unallocated".into()),
+                            other => panic!("unexpected allocation {other:?}"),
+                        };
+                        let _ = reply.send(result);
+                    }
                 }
             }
         });
@@ -1150,6 +1186,17 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let uri = "/dashboard/api/allocate";
+        let response = send(&app, "POST", uri, Some(&session), Some(json!({}))).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let body = json!({"to": "alice", "amount": "1KB"});
+        let response = send(&app, "POST", uri, Some(&session), Some(body)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body_json(response).await,
+            json!({"error": "nothing is unallocated"})
+        );
     }
 
     #[tokio::test]

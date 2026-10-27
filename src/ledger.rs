@@ -28,6 +28,7 @@ pub enum EntryKind {
     Credit,
     Expiry,
     Transfer,
+    Allocate,
 }
 
 impl EntryKind {
@@ -37,6 +38,7 @@ impl EntryKind {
             EntryKind::Credit => "credit",
             EntryKind::Expiry => "expiry",
             EntryKind::Transfer => "transfer",
+            EntryKind::Allocate => "allocate",
         }
     }
 
@@ -46,6 +48,7 @@ impl EntryKind {
             EntryKind::Credit,
             EntryKind::Expiry,
             EntryKind::Transfer,
+            EntryKind::Allocate,
         ]
         .into_iter()
         .find(|kind| kind.as_str() == text)
@@ -92,6 +95,7 @@ pub struct Member {
 pub struct Assignments {
     pub split: HashSet<String>,
     pub owners: HashMap<String, String>,
+    pub exclusive: bool,
 }
 
 fn split_by(amount: u64, weights: &[u64]) -> Vec<u64> {
@@ -281,7 +285,8 @@ impl Book {
                     package: Some(id.clone()),
                     note: String::new(),
                 });
-            } else if assignments.split.contains(id) && !names.is_empty() {
+            } else if (assignments.exclusive || assignments.split.contains(id)) && !names.is_empty()
+            {
                 for (name, share) in names.iter().zip(split_evenly(total, names.len())) {
                     *self.balances.entry((*name).to_owned()).or_insert(0) += signed(share);
                     entries.push(Entry {
@@ -340,7 +345,76 @@ impl Book {
                 });
             }
         }
+        if assignments.exclusive
+            && let [member] = members
+        {
+            let sweep = self.unallocated();
+            *self.balances.get_mut(&member.name).expect("member joined") += sweep;
+            if sweep > 0 {
+                entries.push(Entry {
+                    time: now,
+                    kind: EntryKind::Allocate,
+                    user: member.name.clone(),
+                    amount: sweep,
+                    package: None,
+                    note: String::new(),
+                });
+            }
+        }
         entries
+    }
+
+    pub fn allocate(
+        &mut self,
+        members: &[Member],
+        to: Option<&str>,
+        amount: Option<u64>,
+        now: i64,
+    ) -> Result<Vec<Entry>, String> {
+        if !self.migrated {
+            return Err("remote accounting has not synced yet".into());
+        }
+        let available = self.unallocated();
+        if available <= 0 {
+            return Err("nothing is unallocated".into());
+        }
+        let amount = amount.unwrap_or(available as u64);
+        if amount == 0 {
+            return Err("allocation amount must be positive".into());
+        }
+        if signed(amount) > available {
+            return Err(format!(
+                "only {} is unallocated",
+                format_size(available as u64)
+            ));
+        }
+        let names: Vec<String> = match to {
+            Some(name) => {
+                if !members.iter().any(|member| member.name == name) {
+                    return Err(format!("unknown user {name:?}"));
+                }
+                vec![name.to_owned()]
+            }
+            None => members.iter().map(|member| member.name.clone()).collect(),
+        };
+        if names.is_empty() {
+            return Err("there are no users to allocate to".into());
+        }
+        self.join(members);
+        let shares = split_evenly(amount, names.len());
+        let mut entries = Vec::new();
+        for (name, share) in names.into_iter().zip(shares) {
+            *self.balances.get_mut(&name).expect("joined") += signed(share);
+            entries.push(Entry {
+                time: now,
+                kind: EntryKind::Allocate,
+                user: name,
+                amount: signed(share),
+                package: None,
+                note: String::new(),
+            });
+        }
+        Ok(entries)
     }
 
     pub fn transfer(
@@ -534,6 +608,7 @@ mod tests {
         let assignments = Assignments {
             split: HashSet::from(["s".to_owned()]),
             owners: HashMap::from([("o".to_owned(), "b".to_owned())]),
+            exclusive: false,
         };
         let packages = vec![
             package("old", 20, 20, "Effective"),
@@ -675,6 +750,94 @@ mod tests {
 
         let err = Book::default()
             .transfer(&members, "a", "b", 1, 1)
+            .unwrap_err();
+        assert!(err.contains("not synced"), "{err}");
+    }
+
+    #[test]
+    fn exclusive_member_tracks_the_provider() {
+        let mut book = Book::default();
+        book.reconcile(
+            vec![package("p", 100, 100, "Effective")],
+            &[],
+            &Assignments::default(),
+            1,
+        );
+        assert_eq!(book.unallocated(), 100);
+        let exclusive = Assignments {
+            exclusive: true,
+            ..Default::default()
+        };
+        let solo = [member("solo", 0, None)];
+
+        let entries = book.reconcile(
+            vec![package("p", 100, 100, "Effective")],
+            &solo,
+            &exclusive,
+            2,
+        );
+
+        assert_eq!(balance(&book, "solo"), 100);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, EntryKind::Allocate);
+
+        let entries = book.reconcile(
+            vec![
+                package("p", 100, 90, "Effective"),
+                package("n", 50, 50, "Effective"),
+            ],
+            &solo,
+            &exclusive,
+            3,
+        );
+
+        assert_eq!(book.packages["n"].credit, Some(Credit::Split));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, EntryKind::Credit);
+        assert_eq!(balance(&book, "solo"), 140);
+        assert_eq!(book.unallocated(), 0);
+        assert_eq!(book.limit("solo"), Some(140));
+    }
+
+    #[test]
+    fn unallocated_traffic_can_be_allocated() {
+        let mut book = migrated(
+            &[("a", 0), ("b", 0)],
+            vec![package("p", 100, 100, "Effective")],
+        );
+        let members = [member("a", 0, None), member("b", 0, None)];
+        assert_eq!(book.unallocated(), 0);
+        let err = book.allocate(&members, None, None, 2).unwrap_err();
+        assert!(err.contains("nothing"), "{err}");
+
+        book.reconcile(
+            vec![
+                package("p", 100, 100, "Effective"),
+                package("x", 51, 51, "Effective"),
+            ],
+            &members,
+            &Assignments::default(),
+            2,
+        );
+        assert_eq!(book.unallocated(), 51);
+        for (to, amount, want) in [
+            (Some("z"), None, "unknown user"),
+            (None, Some(52), "only"),
+            (None, Some(0), "positive"),
+        ] {
+            let err = book.allocate(&members, to, amount, 3).unwrap_err();
+            assert!(err.contains(want), "{err}");
+        }
+
+        let entries = book.allocate(&members, Some("b"), Some(10), 3).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(balance(&book, "b"), 60);
+        let entries = book.allocate(&members, None, None, 4).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!((balance(&book, "a"), balance(&book, "b")), (71, 80));
+        assert_eq!(book.unallocated(), 0);
+        let err = Book::default()
+            .allocate(&members, None, None, 1)
             .unwrap_err();
         assert!(err.contains("not synced"), "{err}");
     }
