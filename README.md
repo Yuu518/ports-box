@@ -6,6 +6,7 @@ A TCP/UDP port forwarder for Linux with per-user traffic quotas.
 - **Failover (fallback)**: each rule can have multiple backup targets — when the primary target is unavailable it automatically switches by priority and switches back once the primary recovers; rules that include TCP detect recovery via background health checks (every 10 seconds by default)
 - **Domain name resolution**: forwarding targets can be domain names, resolved using the host's DNS configuration (`/etc/resolv.conf`, `/etc/hosts`) and cached according to record TTL — after a domain's records change, new connections automatically use the new address without a restart
 - **Traffic quotas (optional)**: quotas can be set per user, or a single `total_quota` can be split evenly among users without an individual quota; if neither is set, that user is **unlimited** (usage is recorded but not enforced); usage follows the carrier billing model — each **local wall-clock hour** is a billing period charged as the **larger of inbound and outbound** in that hour (`max(upload, download)`), and billed usage is the sum over hours
+- **Remote sync (optional)**: instead of a fixed local quota, keep a balance per user that is reconciled against the provider's traffic packages (currently Volcengine shared traffic packages), so the remaining traffic matches the provider console; new packages are credited to all users or to one user, and balances can be transferred between users (see "Remote sync" below)
 - **Hard stop on quota exhaustion**: new connections are rejected, in-flight connections are closed immediately, UDP packets are dropped; service resumes as soon as the quota is raised in the config (no restart needed)
 - **Usage persistence (optional)**: with `state_file` configured, used traffic is stored in a SQLite database (flushed every 10 seconds by default and on exit), so counters survive restarts; without it, usage is kept in memory only and resets to zero on restart
 - **Config auto-reload**: edits to the config file are picked up automatically without a restart; an invalid config is rejected and the running one is kept (see "Config auto-reload" below)
@@ -207,9 +208,11 @@ users:
 | `state_file` | Optional; omit the whole section to disable usage persistence (counters reset on restart). Subfields: `enabled` (default `true`, set `false` to disable temporarily), `path` (SQLite database path, default `state.db`, relative to the working directory), `flush_secs` (flush interval in seconds, default `10`) |
 | `api` | Optional; omit to not start the query API. `token` is also optional; when set, every request must carry the token |
 | `panel` | Optional; the web panel only starts when `enabled` is explicitly `true` (default `false`). Subfields: `listen` (default `127.0.0.1:8888`), `token` (entry token), `username`, `password` — all optional, but `username` and `password` go together — and `path` (where the panel stores its changes, default `panel.json`, relative to the working directory). See "Web panel" below |
-| `total_quota` | Optional; users without their own `quota` split this total evenly |
+| `total_quota` | Optional; users without their own `quota` split this total evenly (offline accounting) |
+| `accounting` | Optional; how usage turns into limits. Subfields: `mode` (`offline`, the default, or `remote`), `metering` (`max`, the default, bills the larger direction of each hour; `sum` bills upload plus download; `download` bills only traffic sent back to clients) and `remote` (see "Remote sync" below) |
 | `rules` | Single-user shorthand: a top-level rule list, equivalent to a user named `default`; mutually exclusive with `users`. `rules` or `users` is required unless the panel is enabled |
-| `users[].quota` | Optional; this user's quota, taking precedence over the `total_quota` share. When neither `quota` nor `total_quota` is set, the user is unlimited |
+| `users[].quota` | Optional; this user's quota, taking precedence over the `total_quota` share. When neither `quota` nor `total_quota` is set, the user is unlimited. Offline accounting only |
+| `users[].packages` | Optional; traffic package ids credited to this user alone. Remote accounting only |
 | `rules[].listen` | Listen address (`IP:port`) |
 | `rules[].target` | Forwarding target (`host:port`, domain names supported — see "Domain name resolution" below) |
 | `rules[].fallback` | Optional; backup target(s), a single string or a list (in order as second, third priority, …); switches over automatically when `target` is unavailable and switches back on recovery |
@@ -239,6 +242,47 @@ IP literals (including IPv6 in the `[::1]:80` form) bypass DNS. Invalid domain n
 
 Quota changes (including adding traffic) take effect as soon as the config file is saved (see "Config auto-reload"); used traffic is kept. With `state_file` enabled, used traffic is also restored from the database after a restart, so restarting does not reset the counters.
 
+## Remote sync
+
+Offline accounting compares lifetime usage with a fixed `total_quota`. When the provider sells traffic as packages that never reset, that drifts away from the console: packages are bought and expire, the provider may bill a relay differently from what ports-box measures, and other resources in the region draw from the same packages. Remote accounting fixes this by keeping a **balance** per user and reconciling it with the provider on every sync.
+
+```json
+"accounting": {
+  "mode": "remote",
+  "metering": "sum",
+  "remote": {
+    "provider": "volcengine",
+    "access_key": "AK...",
+    "secret_key": "SK...",
+    "regions": ["cn-shanghai"],
+    "interval_secs": 600,
+    "packages": ["tfp-aaaa"]
+  }
+},
+"users": [
+  { "name": "eric", "packages": ["tfp-bbbb"], "rules": [ ... ] }
+]
+```
+
+| Field | Description |
+|---|---|
+| `provider` | `volcengine` (shared traffic packages, read through the billing API `ListResourcePackages`) |
+| `access_key`, `secret_key` | Required in remote mode. Use a sub-account key that can only read billing |
+| `regions` | Required in remote mode. Only packages whose region is listed are counted; packages elsewhere are reported in the panel and ignored |
+| `interval_secs` | Default `600`, at least `60`; a failed sync is retried after a minute |
+| `packages` | Package ids split evenly among all users when they are credited |
+
+How a sync works:
+
+- **First sync (migration).** Every package that exists at that moment is marked as already counted, and each user's opening balance is their offline remaining traffic scaled so that the balances add up to the provider's remaining traffic. Until the first sync succeeds, offline limits stay in effect.
+- **New packages are credited once, only if listed.** A package listed under `remote.packages` is split evenly among the current users; a package listed under a user's `packages` goes to that user in full. Unlisted packages are shown as unallocated until you list them. Listing a package again, moving it, or removing it after it was credited changes nothing; transfer balances instead.
+- **Consumption is calibrated.** The drop in the provider's remaining traffic since the last sync is charged to users in proportion to the traffic ports-box metered for each of them, so the balances keep adding up to the console. If nothing was metered, the drop is not charged and shows up as negative unallocated traffic.
+- **Expired leftovers are forfeited by balance.** The provider drains packages in expiry order across the whole region, so a package's leftover at expiry cannot be traced to a user; it is taken from users in proportion to their balances.
+- **Limits between syncs.** Each user may use their balance as of the last sync; local metering stops them in real time, and the next sync corrects the difference. A user with no balance (for example one just added) is stopped until they receive some.
+- **Transfers.** The panel moves balance between users; a user can only give what they have left.
+
+Balances, package snapshots, and a ledger of every credit, transfer, and forfeit are kept in `state_file`. Without it they live in memory and the next start migrates again. Switching back to `offline` uses `total_quota` and `quota` again; the ledger is kept and resumes when remote mode is turned back on.
+
 ## Config auto-reload
 
 The config file is checked every 3 seconds; when its content changes (and stays the same for another 0.5 seconds, so a half-written file is never picked up), it is reloaded without a restart:
@@ -248,6 +292,7 @@ The config file is checked every 3 seconds; when its content changes (and stays 
 - Removed or disabled rules stop listening, and their TCP connections and UDP sessions are closed.
 - A changed rule (different `target`, `fallback`, `protocol`, `check_secs`, or owner) is restarted: its existing connections are closed and new ones use the new settings. The listening socket is handed over, not rebound, so the port never goes away.
 - Quota changes (`quota`, `total_quota`) apply immediately and keep used traffic: raising a quota re-enables an exhausted user, lowering it below the used amount stops that user's traffic at once.
+- `accounting` changes apply immediately; a change to the remote settings or to any package list triggers a sync right away.
 - New users start from the usage stored in `state_file` (if any); removed users have their usage flushed to it first.
 - Changes to `api`, `panel`, and `state_file` are not applied live; a warning is logged and they take effect after a restart.
 
@@ -261,13 +306,19 @@ The panel is off unless the config says `"panel": { "enabled": true, ... }`. It 
 2. With a `username` and `password`, sign in with them. With a token alone, the token link signs you in. With neither, the dashboard opens straight away and has no sign-out button.
 3. For the next 7 days the browser can open `/dashboard` directly. Sessions live in memory, so a restart requires the token link or a new sign-in.
 
-**Overview** shows each user's quota, billed usage, current-hour usage, and raw upload/download, plus every rule with its targets: which one is in use, which are on standby, and which are down. It refreshes every 3 seconds.
+**Overview** shows each user's quota, billed usage, current-hour usage, and raw upload/download, plus every rule with its targets: which one is in use, which are on standby, and which are down. It refreshes every 3 seconds. In remote mode it also shows the provider's remaining traffic, the sum of balances, unallocated traffic, the last sync and its result, a **Sync now** button, and a form to transfer balance between users; each user shows their balance instead of a quota.
 
-**Users and rules** edits `total_quota`, users, quotas, and rules. Saving validates the result, binds any new ports, and applies it immediately (it works with `--no-reload` too); if anything fails, nothing changes and the error is shown. Things to know:
+**Traffic packages** lists the packages in the configured regions after a sync, with their remaining traffic, expiry, status, and how they were credited. An uncredited package can be split among all users or given to one user from here, which adds it to the matching list and syncs at once.
+
+**Ledger** lists opening balances, credited packages, forfeited leftovers, and transfers, filterable by user.
+
+**Settings** edits `accounting` and `total_quota`: the accounting mode, metering, and the remote provider, keys, regions, interval, and evenly split packages. The secret key is never sent back to the browser; leave it empty to keep the saved one. **Test connection** queries the provider with the values in the form and changes nothing.
+
+**Users and rules** edits users, quotas, own packages, and rules. Saving validates the result, binds any new ports, and applies it immediately (it works with `--no-reload` too); if anything fails, nothing changes and the error is shown. Things to know:
 
 - With the panel enabled, the config file may leave out `users` and `rules` entirely: the process starts with nothing forwarded, and users and rules are added from the panel.
-- Saving **never touches the config file**. The panel keeps its changes in its own store, `panel.path` (default `panel.json`, relative to the working directory), and they survive restarts.
-- **Editing the config file takes over again.** Whoever changed things last wins: as soon as the config file's content changes — while running, or while the process was stopped — the file is used as written, the panel's saved changes are dropped, and `panel.json` is deleted. Any change to the file counts, even one outside `users` and `total_quota`.
+- Saving **never touches the config file**. The panel keeps its changes in its own store, `panel.path` (default `panel.json`, relative to the working directory), and they survive restarts. The store holds the remote secret key in plain text; on Unix it is written with mode `0600`.
+- **Editing the config file takes over again.** Whoever changed things last wins: as soon as the config file's content changes — while running, or while the process was stopped — the file is used as written, the panel's saved changes are dropped, and `panel.json` is deleted. Any change to the file counts, even one outside `users`, `total_quota`, and `accounting`.
 - If a changed config file is rejected (syntax error, port in use, …), the running config, including the panel's changes, stays in effect until the file is fixed.
 - The `api`, `state_file`, and `panel` sections always come from the config file and cannot be edited from the panel.
 - The working directory must be writable (as it already is for `state.db`); the config file itself can stay read-only, so a Docker `:ro` mount keeps working. Without host networking, set `panel.listen` to `0.0.0.0:8888` and map the port.

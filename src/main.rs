@@ -1,13 +1,17 @@
+mod accounting;
 mod api;
 mod config;
 mod dns;
+mod ledger;
 mod panel;
 mod pool;
+mod provider;
 mod quota;
 mod runtime;
 mod state;
 mod tcp;
 mod udp;
+mod volcengine;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -19,8 +23,10 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
+use crate::accounting::{Engine, RemoteLimits};
 use crate::config::Config;
-use crate::panel::{ConfigEdit, Live, SaveError, Store};
+use crate::ledger::Book;
+use crate::panel::{Channels, ConfigEdit, Live, SaveError, Store};
 use crate::runtime::Runtime;
 use crate::state::StateDb;
 
@@ -140,7 +146,18 @@ async fn run(args: Args) -> Result<(), String> {
         .and_then(|path| restore(&config, &raw, path));
     let from_panel = stored.is_some();
     let effective = stored.unwrap_or_else(|| config.clone());
-    let mut runtime = Runtime::new(db.as_ref().map(|(db, _)| db.clone()));
+    let (book, entries) = match &db {
+        Some((db, _)) => (
+            db.load_book()?.unwrap_or_default(),
+            db.recent_entries(accounting::RECENT_ENTRIES)?,
+        ),
+        None => (Book::default(), Vec::new()),
+    };
+    if db.is_none() && effective.accounting.active_remote().is_some() {
+        warn!("remote accounting without state_file keeps balances in memory only");
+    }
+    let limits = RemoteLimits::new(&book);
+    let mut runtime = Runtime::new(db.as_ref().map(|(db, _)| db.clone()), limits.clone());
     runtime.apply(&effective).await?;
     if effective.users.is_empty() {
         info!("no users configured yet; add them from the panel");
@@ -170,6 +187,17 @@ async fn run(args: Args) -> Result<(), String> {
         revision: 0,
         from_panel,
     }));
+    let engine = Engine::new(
+        db.as_ref().map(|(db, _)| db.clone()),
+        live.subscribe(),
+        runtime.users(),
+        limits,
+        book,
+        entries,
+    );
+    let accounting_status = engine.status();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    tokio::spawn(engine.run(command_rx));
     let (save_tx, mut save_rx) = mpsc::channel(1);
     if let Some(panel) = config.panel() {
         let listener = TcpListener::bind(panel.listen)
@@ -190,10 +218,14 @@ async fn run(args: Args) -> Result<(), String> {
         }
         let router = panel::router(
             panel,
-            live.subscribe(),
-            runtime.users(),
-            runtime.pools(),
-            save_tx,
+            Channels {
+                live: live.subscribe(),
+                users: runtime.users(),
+                pools: runtime.pools(),
+                saves: save_tx,
+                accounting: accounting_status,
+                commands: command_tx,
+            },
         );
         tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, router).await {
@@ -274,6 +306,7 @@ fn restore(file: &Config, raw: &str, path: &Path) -> Option<Config> {
     }
     let edited = Config {
         total_quota: store.total_quota,
+        accounting: store.accounting.unwrap_or_else(|| file.accounting.clone()),
         users: store.users,
         ..file.clone()
     };
@@ -341,13 +374,19 @@ async fn save(
             "the config changed after this page loaded it".into(),
         ));
     }
+    let mut accounting = edit
+        .accounting
+        .unwrap_or_else(|| current.config.accounting.clone());
+    panel::keep_secret(&mut accounting, &current.config.accounting);
     let store = Store {
         base: file_raw.to_owned(),
         total_quota: edit.total_quota,
+        accounting: Some(accounting),
         users: edit.users,
     };
     let next = config::check(Config {
         total_quota: store.total_quota,
+        accounting: store.accounting.clone().unwrap_or_default(),
         users: store.users.clone(),
         ..current.config.clone()
     })

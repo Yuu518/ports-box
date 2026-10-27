@@ -3,10 +3,11 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use tokio::sync::watch;
 use tracing::{error, info};
 
+use crate::ledger::{Book, Entry, EntryKind};
 use crate::quota::{SavedUsage, UserQuota, clock};
 use crate::runtime::UserSet;
 
@@ -54,6 +55,23 @@ impl StateDb {
             [],
         )
         .map_err(|e| format!("cannot create usage table: {e}"))?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS ledger_book (
+                id         INTEGER PRIMARY KEY CHECK (id = 1),
+                book       TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS ledger_entries (
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                time    INTEGER NOT NULL,
+                kind    TEXT NOT NULL,
+                user    TEXT NOT NULL,
+                amount  INTEGER NOT NULL,
+                package TEXT,
+                note    TEXT NOT NULL DEFAULT ''
+            );",
+        )
+        .map_err(|e| format!("cannot create ledger tables: {e}"))?;
         migrate(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -141,6 +159,89 @@ impl StateDb {
         tx.commit().map_err(|e| e.to_string())?;
         last.extend(dirty);
         Ok(())
+    }
+
+    pub fn load_book(&self) -> Result<Option<Book>, String> {
+        let conn = self.conn.lock().unwrap();
+        let raw: Option<String> = conn
+            .query_row("SELECT book FROM ledger_book WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(|e| format!("cannot read ledger: {e}"))?;
+        raw.map(|raw| serde_json::from_str(&raw).map_err(|e| format!("invalid ledger: {e}")))
+            .transpose()
+    }
+
+    pub fn save_book(&self, book: &Book, entries: &[Entry]) -> Result<(), String> {
+        let json = serde_json::to_string(book).map_err(|e| format!("cannot encode ledger: {e}"))?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO ledger_book (id, book, updated_at) VALUES (1, ?1, datetime('now'))
+             ON CONFLICT(id) DO UPDATE SET book = excluded.book, updated_at = excluded.updated_at",
+            [&json],
+        )
+        .map_err(|e| e.to_string())?;
+        {
+            let mut stmt = tx
+                .prepare_cached(
+                    "INSERT INTO ledger_entries (time, kind, user, amount, package, note)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )
+                .map_err(|e| e.to_string())?;
+            for entry in entries {
+                stmt.execute(rusqlite::params![
+                    entry.time,
+                    entry.kind.as_str(),
+                    entry.user,
+                    entry.amount,
+                    entry.package,
+                    entry.note,
+                ])
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    pub fn recent_entries(&self, limit: usize) -> Result<Vec<Entry>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT time, kind, user, amount, package, note FROM ledger_entries
+                 ORDER BY id DESC LIMIT ?1",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([limit as i64], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut entries = Vec::new();
+        for row in rows {
+            let (time, kind, user, amount, package, note) = row.map_err(|e| e.to_string())?;
+            let Some(kind) = EntryKind::parse(&kind) else {
+                continue;
+            };
+            entries.push(Entry {
+                time,
+                kind,
+                user,
+                amount,
+                package,
+                note,
+            });
+        }
+        entries.reverse();
+        Ok(entries)
     }
 
     /// Merges the WAL into the main database file with an fsync, making
@@ -387,6 +488,44 @@ mod tests {
             })
             .unwrap();
         assert_ne!(updated, "sentinel");
+    }
+
+    #[test]
+    fn ledger_persists_book_and_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let db = StateDb::open(&path).unwrap();
+        assert_eq!(db.load_book().unwrap(), None);
+        assert!(db.recent_entries(10).unwrap().is_empty());
+
+        let mut book = Book {
+            migrated: true,
+            remaining: 42,
+            ..Default::default()
+        };
+        book.balances.insert("alice".into(), 42);
+        let entry = |amount: i64| Entry {
+            time: 9,
+            kind: EntryKind::Transfer,
+            user: "alice".into(),
+            amount,
+            package: None,
+            note: "bob".into(),
+        };
+        db.save_book(&book, &[entry(1), entry(2)]).unwrap();
+        book.remaining = 40;
+        db.save_book(&book, &[entry(3)]).unwrap();
+        drop(db);
+
+        let db = StateDb::open(&path).unwrap();
+        assert_eq!(db.load_book().unwrap(), Some(book));
+        let amounts: Vec<i64> = db
+            .recent_entries(2)
+            .unwrap()
+            .iter()
+            .map(|entry| entry.amount)
+            .collect();
+        assert_eq!(amounts, [2, 3]);
     }
 
     #[test]

@@ -1,7 +1,9 @@
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU8, AtomicU64, Ordering};
 
 use tokio::sync::watch;
+
+use crate::config::Metering;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Direction {
@@ -84,21 +86,49 @@ pub struct UserQuota {
     hour_upload: AtomicU64,
     hour_download: AtomicU64,
     bucket_hour: AtomicI64,
+    metering: AtomicU8,
     /// Serializes rollover and snapshotting; never held across an await.
     settle_lock: Mutex<()>,
     exhausted: watch::Sender<bool>,
 }
 
+fn metering_code(metering: Metering) -> u8 {
+    match metering {
+        Metering::Max => 0,
+        Metering::Sum => 1,
+        Metering::Download => 2,
+    }
+}
+
+fn metering_from(code: u8) -> Metering {
+    match code {
+        1 => Metering::Sum,
+        2 => Metering::Download,
+        _ => Metering::Max,
+    }
+}
+
 impl UserQuota {
-    pub fn new(name: String, limit: Option<u64>, saved: SavedUsage) -> Self {
-        Self::new_at(name, limit, saved, clock::current_hour_id())
+    pub fn new(name: String, limit: Option<u64>, saved: SavedUsage, metering: Metering) -> Self {
+        Self::new_metered_at(name, limit, saved, metering, clock::current_hour_id())
     }
 
     /// `new` with the hour injected; pub(crate) so tests control time.
+    #[cfg(test)]
     pub(crate) fn new_at(
         name: String,
         limit: Option<u64>,
         saved: SavedUsage,
+        now_hour: i64,
+    ) -> Self {
+        Self::new_metered_at(name, limit, saved, Metering::Max, now_hour)
+    }
+
+    pub(crate) fn new_metered_at(
+        name: String,
+        limit: Option<u64>,
+        saved: SavedUsage,
+        metering: Metering,
         now_hour: i64,
     ) -> Self {
         // A snapshot from an earlier hour settles before use; one from the
@@ -107,12 +137,12 @@ impl UserQuota {
             (saved.settled, saved.hour_upload, saved.hour_download)
         } else {
             (
-                saved.settled + saved.hour_upload.max(saved.hour_download),
+                saved.settled + metering.bill(saved.hour_upload, saved.hour_download),
                 0,
                 0,
             )
         };
-        let used = settled + hour_up.max(hour_down);
+        let used = settled + metering.bill(hour_up, hour_down);
         let (exhausted, _) = watch::channel(limit.is_some_and(|l| used >= l));
         Self {
             name,
@@ -123,6 +153,7 @@ impl UserQuota {
             hour_upload: AtomicU64::new(hour_up),
             hour_download: AtomicU64::new(hour_down),
             bucket_hour: AtomicI64::new(now_hour),
+            metering: AtomicU8::new(metering_code(metering)),
             settle_lock: Mutex::new(()),
             exhausted,
         }
@@ -176,13 +207,26 @@ impl UserQuota {
         // buffer into the new hour; bytes are never lost.
         let up = self.hour_upload.swap(0, Ordering::Relaxed);
         let down = self.hour_download.swap(0, Ordering::Relaxed);
-        self.settled.fetch_add(up.max(down), Ordering::Release);
+        self.settled
+            .fetch_add(self.metering().bill(up, down), Ordering::Release);
         self.bucket_hour.store(now_hour, Ordering::Relaxed);
         clock::refresh_offset();
     }
 
     pub fn limit(&self) -> Option<u64> {
         Some(self.limit.load(Ordering::Relaxed)).filter(|&l| l != NO_LIMIT)
+    }
+
+    pub fn metering(&self) -> Metering {
+        metering_from(self.metering.load(Ordering::Relaxed))
+    }
+
+    pub fn set_metering(&self, metering: Metering) {
+        self.metering
+            .store(metering_code(metering), Ordering::Relaxed);
+        if let Some(limit) = self.limit() {
+            self.set_limit(Some(limit));
+        }
     }
 
     pub fn set_limit(&self, limit: Option<u64>) {
@@ -212,12 +256,11 @@ impl UserQuota {
         self.total_download.load(Ordering::Relaxed)
     }
 
-    /// The current hour's billed traffic so far: the larger direction of
-    /// its bucket.
     pub fn hour_used(&self) -> u64 {
-        self.hour_upload
-            .load(Ordering::Relaxed)
-            .max(self.hour_download.load(Ordering::Relaxed))
+        self.metering().bill(
+            self.hour_upload.load(Ordering::Relaxed),
+            self.hour_download.load(Ordering::Relaxed),
+        )
     }
 
     /// Billed usage: every settled hour's larger direction summed, plus
@@ -439,9 +482,57 @@ mod tests {
         assert!(quota.try_consume_at(1 << 30, Direction::Download, H));
     }
 
+    #[test]
+    fn metering_shapes_hourly_and_settled_usage() {
+        let quota =
+            UserQuota::new_metered_at("a".into(), None, SavedUsage::default(), Metering::Sum, H);
+        assert!(quota.try_consume_at(60, Direction::Upload, H));
+        assert!(quota.try_consume_at(40, Direction::Download, H));
+        assert_eq!(quota.hour_used(), 100);
+        assert!(quota.try_consume_at(5, Direction::Upload, H + 1));
+        assert_eq!(quota.used(), 105);
+
+        quota.set_metering(Metering::Download);
+        assert_eq!(quota.hour_used(), 0);
+        assert!(quota.try_consume_at(7, Direction::Download, H + 2));
+        assert_eq!(quota.used(), 107);
+    }
+
+    #[test]
+    fn restore_settles_with_metering() {
+        let saved = SavedUsage {
+            upload: 40,
+            download: 20,
+            settled: 0,
+            hour_upload: 40,
+            hour_download: 20,
+            hour_id: H - 1,
+        };
+        let quota = UserQuota::new_metered_at("a".into(), None, saved, Metering::Download, H);
+        assert_eq!(quota.used(), 20);
+    }
+
+    #[test]
+    fn metering_change_reevaluates_exhaustion() {
+        let quota = UserQuota::new_metered_at(
+            "a".into(),
+            Some(100),
+            SavedUsage::default(),
+            Metering::Max,
+            H,
+        );
+        assert!(quota.try_consume_at(60, Direction::Upload, H));
+        assert!(quota.try_consume_at(60, Direction::Download, H));
+        assert!(!quota.is_exhausted());
+
+        quota.set_metering(Metering::Sum);
+
+        assert!(quota.is_exhausted());
+    }
+
     #[tokio::test]
     async fn exhausted_future_resolves() {
-        let quota = UserQuota::new("a".into(), Some(10), SavedUsage::default());
+        let quota = UserQuota::new("a".into(), Some(10), SavedUsage::default(), Metering::Max);
         let rx = quota.subscribe();
         let waiter = tokio::spawn(exhausted(rx));
         assert!(!waiter.is_finished());

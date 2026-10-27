@@ -13,12 +13,17 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 use tracing::warn;
 
+use crate::accounting::{self, Command};
 use crate::api::{UserUsage, token_matches};
-use crate::config::{ByteSize, Config, PanelConfig, Protocol, Rule, UserConfig};
+use crate::config::{
+    Accounting, ByteSize, Config, PanelConfig, Protocol, RemoteConfig, Rule, UserConfig,
+};
+use crate::provider;
 use crate::quota::clock;
 use crate::runtime::{PoolMap, UserSet};
 
@@ -41,6 +46,8 @@ pub struct Store {
     pub base: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_quota: Option<ByteSize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accounting: Option<Accounting>,
     pub users: Vec<UserConfig>,
 }
 
@@ -73,7 +80,14 @@ pub async fn write_store(path: &Path, store: &Store) -> Result<(), String> {
     }
     let mut partial = path.as_os_str().to_owned();
     partial.push(".tmp");
-    tokio::fs::write(&partial, json).await.map_err(failed)?;
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&partial).await.map_err(failed)?;
+    file.write_all(json.as_bytes()).await.map_err(failed)?;
+    file.flush().await.map_err(failed)?;
+    drop(file);
     tokio::fs::rename(&partial, path).await.map_err(failed)
 }
 
@@ -91,7 +105,17 @@ pub struct ConfigEdit {
     pub revision: u64,
     #[serde(default)]
     pub total_quota: Option<ByteSize>,
+    #[serde(default)]
+    pub accounting: Option<Accounting>,
     pub users: Vec<UserConfig>,
+}
+
+pub fn keep_secret(edited: &mut Accounting, current: &Accounting) {
+    if let (Some(remote), Some(previous)) = (&mut edited.remote, &current.remote)
+        && remote.secret_key.is_empty()
+    {
+        remote.secret_key = previous.secret_key.clone();
+    }
 }
 
 #[derive(Debug)]
@@ -111,11 +135,22 @@ struct Session {
     logged_in: bool,
 }
 
+pub struct Channels {
+    pub live: watch::Receiver<Arc<Live>>,
+    pub users: watch::Receiver<Arc<UserSet>>,
+    pub pools: watch::Receiver<Arc<PoolMap>>,
+    pub saves: mpsc::Sender<SaveRequest>,
+    pub accounting: watch::Receiver<Arc<accounting::Status>>,
+    pub commands: mpsc::Sender<Command>,
+}
+
 #[derive(Clone)]
 struct PanelState {
     live: watch::Receiver<Arc<Live>>,
     users: watch::Receiver<Arc<UserSet>>,
     pools: watch::Receiver<Arc<PoolMap>>,
+    accounting: watch::Receiver<Arc<accounting::Status>>,
+    commands: mpsc::Sender<Command>,
     credentials: Arc<PanelConfig>,
     sessions: Arc<Mutex<HashMap<String, Session>>>,
     saves: mpsc::Sender<SaveRequest>,
@@ -193,6 +228,8 @@ struct ConfigView<'a> {
     revision: u64,
     source: &'static str,
     total_quota: Option<ByteSize>,
+    accounting: Accounting,
+    secret_key_set: bool,
     users: &'a [UserConfig],
 }
 
@@ -202,38 +239,38 @@ struct Login {
     password: String,
 }
 
-pub fn router(
-    credentials: &PanelConfig,
-    live: watch::Receiver<Arc<Live>>,
-    users: watch::Receiver<Arc<UserSet>>,
-    pools: watch::Receiver<Arc<PoolMap>>,
-    saves: mpsc::Sender<SaveRequest>,
-) -> Router {
-    router_with_clock(
-        credentials,
-        live,
-        users,
-        pools,
-        saves,
-        clock::current_hour_id,
-    )
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Transfer {
+    from: String,
+    to: String,
+    amount: ByteSize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteTest {
+    remote: RemoteConfig,
+}
+
+pub fn router(credentials: &PanelConfig, channels: Channels) -> Router {
+    router_with_clock(credentials, channels, clock::current_hour_id)
 }
 
 fn router_with_clock(
     credentials: &PanelConfig,
-    live: watch::Receiver<Arc<Live>>,
-    users: watch::Receiver<Arc<UserSet>>,
-    pools: watch::Receiver<Arc<PoolMap>>,
-    saves: mpsc::Sender<SaveRequest>,
+    channels: Channels,
     now_hour: fn() -> i64,
 ) -> Router {
     let state = PanelState {
-        live,
-        users,
-        pools,
+        live: channels.live,
+        users: channels.users,
+        pools: channels.pools,
+        accounting: channels.accounting,
+        commands: channels.commands,
         credentials: Arc::new(credentials.clone()),
         sessions: Arc::default(),
-        saves,
+        saves: channels.saves,
         now_hour,
     };
     let api = Router::new()
@@ -241,6 +278,10 @@ fn router_with_clock(
         .route(LOGOUT, post(logout))
         .route("/dashboard/api/status", get(status))
         .route("/dashboard/api/config", get(get_config).put(put_config))
+        .route("/dashboard/api/ledger", get(ledger))
+        .route("/dashboard/api/sync", post(sync))
+        .route("/dashboard/api/transfer", post(transfer))
+        .route("/dashboard/api/remote/test", post(test_remote))
         .route_layer(middleware::from_fn_with_state(state.clone(), guard));
     Router::new()
         .route("/", get(root))
@@ -419,15 +460,24 @@ async fn status(State(state): State<PanelState>) -> Response {
         })
         .collect();
     let can_sign_out = state.credentials.has_token() || state.credentials.has_login();
-    Json(json!({ "users": users, "can_sign_out": can_sign_out })).into_response()
+    let accounting = state.accounting.borrow().clone();
+    Json(json!({ "users": users, "accounting": *accounting, "can_sign_out": can_sign_out }))
+        .into_response()
 }
 
 async fn get_config(State(state): State<PanelState>) -> Response {
     let live = state.live.borrow().clone();
+    let mut accounting = live.config.accounting.clone();
+    let secret_key_set = accounting
+        .remote
+        .as_mut()
+        .is_some_and(|remote| !std::mem::take(&mut remote.secret_key).is_empty());
     Json(ConfigView {
         revision: live.revision,
         source: if live.from_panel { "panel" } else { "file" },
         total_quota: live.config.total_quota,
+        accounting,
+        secret_key_set,
         users: &live.config.users,
     })
     .into_response()
@@ -435,6 +485,90 @@ async fn get_config(State(state): State<PanelState>) -> Response {
 
 fn failure(status: StatusCode, error: String) -> Response {
     (status, Json(json!({ "error": error }))).into_response()
+}
+
+async fn ledger(State(state): State<PanelState>) -> Response {
+    let entries = state.accounting.borrow().entries.clone();
+    Json(&*entries).into_response()
+}
+
+async fn command(
+    state: &PanelState,
+    build: impl FnOnce(oneshot::Sender<Result<(), String>>) -> Command,
+) -> Response {
+    let (reply, result) = oneshot::channel();
+    if state.commands.send(build(reply)).await.is_err() {
+        return failure(StatusCode::SERVICE_UNAVAILABLE, "shutting down".into());
+    }
+    match result.await {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(e)) => failure(StatusCode::BAD_REQUEST, e),
+        Err(_) => failure(StatusCode::SERVICE_UNAVAILABLE, "shutting down".into()),
+    }
+}
+
+async fn sync(State(state): State<PanelState>) -> Response {
+    command(&state, Command::Sync).await
+}
+
+async fn transfer(
+    State(state): State<PanelState>,
+    body: Result<Json<Transfer>, JsonRejection>,
+) -> Response {
+    let Transfer { from, to, amount } = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => return failure(StatusCode::BAD_REQUEST, rejection.body_text()),
+    };
+    command(&state, |reply| Command::Transfer {
+        from,
+        to,
+        amount: amount.0,
+        reply,
+    })
+    .await
+}
+
+async fn test_remote(
+    State(state): State<PanelState>,
+    body: Result<Json<RemoteTest>, JsonRejection>,
+) -> Response {
+    let mut remote = match body {
+        Ok(Json(body)) => body.remote,
+        Err(rejection) => return failure(StatusCode::BAD_REQUEST, rejection.body_text()),
+    };
+    if remote.secret_key.is_empty()
+        && let Some(current) = &state.live.borrow().config.accounting.remote
+    {
+        remote.secret_key = current.secret_key.clone();
+    }
+    if remote.access_key.is_empty() || remote.secret_key.is_empty() {
+        return failure(
+            StatusCode::BAD_REQUEST,
+            "access key and secret key are required".into(),
+        );
+    }
+    if remote.regions.is_empty() {
+        return failure(
+            StatusCode::BAD_REQUEST,
+            "at least one region is required".into(),
+        );
+    }
+    match provider::fetch(&remote).await {
+        Ok(fetched) => {
+            let effective: Vec<_> = fetched
+                .packages
+                .iter()
+                .filter(|package| package.effective())
+                .collect();
+            Json(json!({
+                "packages": effective.len(),
+                "remaining": effective.iter().map(|package| package.available).sum::<u64>(),
+                "ignored": fetched.ignored.len(),
+            }))
+            .into_response()
+        }
+        Err(e) => failure(StatusCode::BAD_GATEWAY, e),
+    }
 }
 
 async fn put_config(
@@ -464,6 +598,7 @@ mod tests {
     use tower::ServiceExt as _;
 
     use super::*;
+    use crate::config::Mode;
     use crate::pool::TargetPool;
     use crate::quota::{Direction, SavedUsage, UserQuota};
 
@@ -483,6 +618,10 @@ mod tests {
         let store = Store {
             base: "// file text\n{}".into(),
             total_quota: Some(ByteSize(1 << 30)),
+            accounting: Some(Accounting {
+                mode: Mode::Remote,
+                ..Default::default()
+            }),
             users,
         };
         write_store(&path, &store).await.unwrap();
@@ -491,6 +630,13 @@ mod tests {
         let loaded = load_store(&path).unwrap();
         assert_eq!(loaded.base, store.base);
         assert_eq!(loaded.total_quota, store.total_quota);
+        assert_eq!(loaded.accounting, store.accounting);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
         assert_eq!(loaded.users[0].quota, Some(ByteSize(30 << 30)));
         assert_eq!(loaded.users[0].rules[0].tag.as_deref(), Some("web"));
         let names: Vec<_> = std::fs::read_dir(path.parent().unwrap())
@@ -509,6 +655,7 @@ mod tests {
         "api": {"listen": "127.0.0.1:7070", "token": "apisecret"},
         "panel": {"enabled": true, "token": "gate", "username": "admin", "password": "hunter2"},
         "total_quota": "1GB",
+        "accounting": {"remote": {"provider": "volcengine", "access_key": "AKID", "secret_key": "volcsecret", "regions": ["cn-shanghai"]}},
         "users": [
             {"name": "alice", "quota": 1000, "rules": [
                 {"listen": "127.0.0.1:1", "target": "p:1", "fallback": "f:1", "protocol": "tcp", "tag": "web"},
@@ -524,6 +671,11 @@ mod tests {
     }
 
     fn test_app_with(auth: &str) -> (Router, mpsc::Receiver<SaveRequest>) {
+        let (app, saves, _commands) = test_app_full(auth);
+        (app, saves)
+    }
+
+    fn test_app_full(auth: &str) -> (Router, mpsc::Receiver<SaveRequest>, mpsc::Receiver<Command>) {
         let config =
             crate::config::parse(&CONFIG.replace(AUTH, auth), Path::new("config.json")).unwrap();
         let alice = Arc::new(UserQuota::new_at(
@@ -540,20 +692,37 @@ mod tests {
         pools.insert(("127.0.0.1:1".parse().unwrap(), Protocol::Tcp), pool);
         let credentials = config.panel().unwrap().clone();
         let (saves, save_rx) = mpsc::channel(1);
+        let (commands, command_rx) = mpsc::channel(1);
+        let status = accounting::Status {
+            remaining: 42,
+            entries: Arc::new(vec![crate::ledger::Entry {
+                time: 1,
+                kind: crate::ledger::EntryKind::Transfer,
+                user: "alice".into(),
+                amount: 5,
+                package: None,
+                note: "bob".into(),
+            }]),
+            ..Default::default()
+        };
         let app = router_with_clock(
             &credentials,
-            watch::Sender::new(Arc::new(Live {
-                config,
-                revision: 7,
-                from_panel: true,
-            }))
-            .subscribe(),
-            watch::Sender::new(Arc::new(UserSet::new(vec![alice]))).subscribe(),
-            watch::Sender::new(Arc::new(pools)).subscribe(),
-            saves,
+            Channels {
+                live: watch::Sender::new(Arc::new(Live {
+                    config,
+                    revision: 7,
+                    from_panel: true,
+                }))
+                .subscribe(),
+                users: watch::Sender::new(Arc::new(UserSet::new(vec![alice]))).subscribe(),
+                pools: watch::Sender::new(Arc::new(pools)).subscribe(),
+                saves,
+                accounting: watch::Sender::new(Arc::new(status)).subscribe(),
+                commands,
+            },
             || H,
         );
-        (app, save_rx)
+        (app, save_rx, command_rx)
     }
 
     async fn send(
@@ -634,6 +803,10 @@ mod tests {
             ("GET", "/dashboard/api/status", None),
             ("GET", "/dashboard/api/config", None),
             ("PUT", "/dashboard/api/config", Some(json!({}))),
+            ("GET", "/dashboard/api/ledger", None),
+            ("POST", "/dashboard/api/sync", None),
+            ("POST", "/dashboard/api/transfer", Some(json!({}))),
+            ("POST", "/dashboard/api/remote/test", Some(json!({}))),
             ("POST", LOGIN, Some(login)),
             ("POST", LOGOUT, None),
         ] {
@@ -664,6 +837,10 @@ mod tests {
             ("GET", "/dashboard/api/status"),
             ("GET", "/dashboard/api/config"),
             ("PUT", "/dashboard/api/config"),
+            ("GET", "/dashboard/api/ledger"),
+            ("POST", "/dashboard/api/sync"),
+            ("POST", "/dashboard/api/transfer"),
+            ("POST", "/dashboard/api/remote/test"),
         ] {
             let response = send(&app, method, uri, Some(&gate), None).await;
             assert_eq!(
@@ -798,8 +975,13 @@ mod tests {
         let (app, _saves) = test_app();
         let session = log_in(&app).await;
         let response = send(&app, "GET", "/dashboard/api/status", Some(&session), None).await;
+        let mut body = body_json(response).await;
+        let accounting = body.as_object_mut().unwrap().remove("accounting").unwrap();
+        assert_eq!(accounting["remaining"], 42);
+        assert_eq!(accounting["mode"], "offline");
+        assert!(accounting.get("entries").is_none());
         assert_eq!(
-            body_json(response).await,
+            body,
             json!({"can_sign_out": true, "users": [{
                 "name": "alice",
                 "total": "1000B",
@@ -830,10 +1012,14 @@ mod tests {
         let session = log_in(&app).await;
         let response = send(&app, "GET", "/dashboard/api/config", Some(&session), None).await;
         let text = body_text(response).await;
-        for secret in ["apisecret", "gate", "hunter2", "admin"] {
+        for secret in ["apisecret", "gate", "hunter2", "admin", "volcsecret"] {
             assert!(!text.contains(secret), "{text}");
         }
         let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(json["secret_key_set"], true);
+        assert_eq!(json["accounting"]["remote"]["access_key"], "AKID");
+        assert_eq!(json["accounting"]["remote"]["secret_key"], "");
+        assert_eq!(json["accounting"]["mode"], "offline");
         assert_eq!(json["revision"], 7);
         assert_eq!(json["source"], "panel");
         assert_eq!(json["total_quota"], "1GB");
@@ -887,5 +1073,117 @@ mod tests {
         let response = send(&app, "PUT", uri, Some(&session), Some(bad)).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(body_json(response).await["error"].is_string());
+    }
+
+    #[tokio::test]
+    async fn ledger_lists_recent_entries() {
+        let (app, _saves) = test_app();
+        let session = log_in(&app).await;
+        let response = send(&app, "GET", "/dashboard/api/ledger", Some(&session), None).await;
+        assert_eq!(
+            body_json(response).await,
+            json!([{"time": 1, "kind": "transfer", "user": "alice", "amount": 5, "package": null, "note": "bob"}])
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_and_transfer_reach_the_engine() {
+        let (app, _saves, mut commands) = test_app_full(AUTH);
+        let session = log_in(&app).await;
+        tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                match command {
+                    Command::Sync(reply) => {
+                        let _ = reply.send(Err("no packages".into()));
+                    }
+                    Command::Transfer {
+                        from,
+                        to,
+                        amount,
+                        reply,
+                    } => {
+                        assert_eq!((from.as_str(), to.as_str()), ("alice", "bob"));
+                        assert_eq!(amount, 5 << 30);
+                        let _ = reply.send(Ok(()));
+                    }
+                }
+            }
+        });
+
+        let response = send(&app, "POST", "/dashboard/api/sync", Some(&session), None).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await, json!({"error": "no packages"}));
+
+        let body = json!({"from": "alice", "to": "bob", "amount": "5GB"});
+        let response = send(
+            &app,
+            "POST",
+            "/dashboard/api/transfer",
+            Some(&session),
+            Some(body),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let bad = json!({"from": "alice", "to": "bob", "amount": "lots"});
+        let response = send(
+            &app,
+            "POST",
+            "/dashboard/api/transfer",
+            Some(&session),
+            Some(bad),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn remote_test_validates_before_calling_out() {
+        let (app, _saves) = test_app();
+        let session = log_in(&app).await;
+        let uri = "/dashboard/api/remote/test";
+        for (remote, want) in [
+            (
+                json!({"provider": "volcengine", "access_key": "", "regions": ["cn-shanghai"]}),
+                "access key",
+            ),
+            (
+                json!({"provider": "volcengine", "access_key": "AKID", "regions": []}),
+                "region",
+            ),
+        ] {
+            let response = send(
+                &app,
+                "POST",
+                uri,
+                Some(&session),
+                Some(json!({"remote": remote})),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let error = body_json(response).await["error"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(error.contains(want), "{error}");
+        }
+    }
+
+    #[test]
+    fn blank_secret_keeps_the_current_one() {
+        let remote = |secret: &str| Accounting {
+            remote: Some(
+                serde_json::from_value(json!({"provider": "volcengine", "secret_key": secret}))
+                    .unwrap(),
+            ),
+            ..Default::default()
+        };
+        let current = remote("old");
+        let mut edited = remote("");
+        keep_secret(&mut edited, &current);
+        assert_eq!(edited.remote.unwrap().secret_key, "old");
+        let mut edited = remote("new");
+        keep_secret(&mut edited, &current);
+        assert_eq!(edited.remote.unwrap().secret_key, "new");
     }
 }

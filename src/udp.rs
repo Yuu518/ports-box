@@ -303,6 +303,7 @@ async fn active_moved(rx: &mut watch::Receiver<usize>, index: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Metering;
     use crate::quota::SavedUsage;
     use crate::runtime::never_stop;
 
@@ -360,7 +361,12 @@ mod tests {
     }
 
     fn unlimited() -> Arc<UserQuota> {
-        Arc::new(UserQuota::new("a".into(), None, SavedUsage::default()))
+        Arc::new(UserQuota::new(
+            "a".into(),
+            None,
+            SavedUsage::default(),
+            Metering::Max,
+        ))
     }
 
     #[tokio::test]
@@ -431,7 +437,12 @@ mod tests {
 
     #[tokio::test]
     async fn exhausted_quota_drops_packets() {
-        let quota = Arc::new(UserQuota::new("a".into(), Some(3), SavedUsage::default()));
+        let quota = Arc::new(UserQuota::new(
+            "a".into(),
+            Some(3),
+            SavedUsage::default(),
+            Metering::Max,
+        ));
         let pool = TargetPool::new("a".into(), vec![tagged_echo(b"").await], None);
         let client = client(forwarder(pool, quota.clone(), MAX_SESSIONS).await).await;
 

@@ -53,10 +53,10 @@ button, input, select { font: inherit; color: inherit; }
   padding: 1.25rem 0 1rem; border-bottom: 1px solid var(--line);
 }
 .brand { font-size: 1.25rem; font-weight: 650; letter-spacing: -0.01em; margin: 0; }
-.tabs { display: flex; gap: 0.25rem; margin-right: auto; }
+.tabs { display: flex; flex-wrap: wrap; gap: 0.25rem; margin-right: auto; }
 .tab {
   border: 0; background: none; padding: 0.35rem 0.75rem; border-radius: 0.4rem;
-  color: var(--muted); cursor: pointer;
+  color: var(--muted); cursor: pointer; white-space: nowrap;
 }
 .tab[aria-current="page"] { background: var(--sunk); color: var(--ink); font-weight: 600; }
 .plain {
@@ -158,6 +158,37 @@ button, input, select { font: inherit; color: inherit; }
 .door .primary { padding: 0.5rem; border-radius: 0.4rem; cursor: pointer; }
 .door .error { color: var(--down); margin: 0; }
 
+.account { padding: 1.5rem 0 1.25rem; border-bottom: 1px solid var(--line); }
+.account-head { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 1rem; }
+.account-title { font-size: 1.1rem; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
+.account-head .spent { margin-left: auto; }
+.account .facts { margin: 0.75rem 0 0; }
+.note { margin: 0.6rem 0 0; overflow-wrap: anywhere; }
+.note.ok, .test-result.ok { color: var(--live); }
+.note.error, .test-result.error { color: var(--down); }
+.transfer { margin-top: 1rem; }
+.transfer .field { flex: 0 1 11rem; }
+.section-title { font-size: 1rem; font-weight: 650; margin: 0 0 0.75rem; }
+.settings-row .field { flex: 1 1 13rem; }
+.test-result { margin: 0; align-self: center; }
+.pad { padding: 1.25rem 0 0.75rem; }
+.table-wrap { overflow-x: auto; margin-top: 0.75rem; }
+.table { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
+.table th {
+  text-align: left; font-weight: 600; color: var(--muted); font-size: 0.82rem;
+  padding: 0.5rem 0.75rem 0.4rem 0; border-bottom: 1px solid var(--line); white-space: nowrap;
+}
+.table td { padding: 0.55rem 0.75rem 0.55rem 0; border-bottom: 1px solid var(--line); vertical-align: middle; }
+.table .num, .table .mono { white-space: nowrap; }
+.table .num { text-align: right; }
+.table .dim { color: var(--muted); }
+.plus { color: var(--live); }
+.minus { color: var(--down); }
+.credit { display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; }
+.credit select, .filter select {
+  background: var(--surface); border: 1px solid var(--line); border-radius: 0.35rem; padding: 0.3rem 0.45rem;
+}
+
 @media (max-width: 52rem) {
   .route { grid-template-columns: 4.6rem 1fr; }
   .route .wire { display: none; }
@@ -177,7 +208,10 @@ button, input, select { font: inherit; color: inherit; }
 const zh = (navigator.language || "").toLowerCase().startsWith("zh");
 const TEXT = {
   overview: ["Overview", "概览"],
+  packages: ["Traffic packages", "流量包"],
+  ledger: ["Ledger", "流水"],
   edit: ["Users and rules", "用户与规则"],
+  settings: ["Settings", "设置"],
   signOut: ["Sign out", "退出登录"],
   signIn: ["Sign in", "登录"],
   signInLead: ["Sign in to manage port forwarding.", "登录后管理端口转发。"],
@@ -193,6 +227,9 @@ const TEXT = {
   usedOf: ["{0} of {1} used", "已用 {0} / {1}"],
   usedOnly: ["{0} used, no limit", "已用 {0}，不限量"],
   exhausted: ["Quota used up, traffic stopped", "配额已用尽，流量已停止"],
+  noBalance: ["Balance used up, traffic stopped", "余额已用尽，流量已停止"],
+  balanceLeft: ["{0} left", "余额 {0}"],
+  billed: ["Billed", "累计计费"],
   remaining: ["Remaining", "剩余"],
   thisHour: ["This hour", "本小时"],
   upload: ["Upload", "上行"],
@@ -204,8 +241,9 @@ const TEXT = {
   totalQuota: ["Total quota", "总配额"],
   totalHint: ["Users without their own quota split the total evenly. Leave both empty for no limit. Sizes look like 500MB, 30GB or 1.5TB.", "未单独设置配额的用户平分总配额；两者都留空则不限量。大小写法如 500MB、30GB、1.5TB。"],
   name: ["Name", "名称"],
-  quota: ["Quota", "配额"],
+  quota: ["Quota (offline)", "配额（离线）"],
   quotaPlaceholder: ["share of total", "按总配额平分"],
+  userPackages: ["Own packages (remote)", "专属流量包（远程）"],
   none: ["none", "无"],
   on: ["On", "启用"],
   protocol: ["Protocol", "协议"],
@@ -221,13 +259,92 @@ const TEXT = {
   removeUser: ["Remove user", "删除用户"],
   save: ["Save changes", "保存更改"],
   saving: ["Saving", "保存中"],
-  saved: ["Saved. The new rules are live.", "已保存，新规则已生效。"],
+  saved: ["Saved. The changes are live.", "已保存，改动已生效。"],
   fromPanel: ["In effect: changes saved from this panel. The config file is untouched; editing it replaces them.", "当前生效：面板保存的改动。配置文件未被修改；一旦修改配置文件，将以文件为准并丢弃这些改动。"],
   fromFile: ["In effect: the config file.", "当前生效：配置文件。"],
   discard: ["Discard changes", "放弃更改"],
   unsaved: ["Unsaved changes", "有未保存的更改"],
   clean: ["Saving applies at once and leaves the config file untouched.", "保存后立即生效，不会改动配置文件。"],
   reload: ["Load the current config", "加载当前配置"],
+  remoteTitle: ["Remote sync", "远程同步"],
+  syncNow: ["Sync now", "立即同步"],
+  syncing: ["Syncing", "同步中"],
+  lastSync: ["Last sync {0}", "上次同步 {0}"],
+  neverSynced: ["Not synced yet", "尚未同步"],
+  syncFailed: ["Sync failed: {0}", "同步失败：{0}"],
+  waiting: ["Waiting for the first successful sync. Offline limits apply until then.", "等待首次同步成功，在此之前沿用离线限额。"],
+  providerRemaining: ["Provider remaining", "服务商剩余"],
+  balances: ["User balances", "用户余额合计"],
+  unallocated: ["Unallocated", "未分配"],
+  calibration: ["Last interval: provider {0}, metered {1}", "上个周期：服务商扣减 {0}，本地计量 {1}"],
+  transfer: ["Transfer", "转账"],
+  from: ["From", "转出"],
+  to: ["To", "转入"],
+  amount: ["Amount", "数量"],
+  transferDone: ["Transferred.", "转账完成。"],
+  packagesOff: ["Traffic packages appear here once remote sync is set up under Settings.", "在“设置”中配置远程同步后，这里会列出流量包。"],
+  packagesIdle: ["Remote sync is configured but accounting is offline, so nothing is synced.", "已配置远程同步，但统计方式为离线，不会同步。"],
+  noPackages: ["No traffic packages in {0}.", "{0} 没有流量包。"],
+  ignoredPackages: ["{0} packages in other regions are not counted.", "另有 {0} 个其他地域的流量包未计入。"],
+  colId: ["Package", "编号"],
+  colName: ["Name", "名称"],
+  colRegion: ["Region", "地域"],
+  colTotal: ["Total", "总量"],
+  colAvailable: ["Remaining", "剩余"],
+  colExpiry: ["Expires", "到期"],
+  colStatus: ["Status", "状态"],
+  colCredit: ["Credit", "入账"],
+  colTime: ["Time", "时间"],
+  colKind: ["Type", "类型"],
+  colUser: ["User", "用户"],
+  colAmount: ["Amount", "数量"],
+  colNote: ["Detail", "说明"],
+  creditMigration: ["Counted at migration", "迁移时已计入"],
+  creditSplit: ["Split evenly", "已平分"],
+  creditUser: ["Given to {0}", "已给 {0}"],
+  creditNone: ["Not credited", "未入账"],
+  splitAll: ["Split among all users", "平分给所有用户"],
+  giveTo: ["Give to {0}", "给 {0}"],
+  credit: ["Credit", "入账"],
+  crediting: ["Crediting", "入账中"],
+  credited: ["Saved and synced.", "已保存并同步。"],
+  statusEffective: ["Effective", "生效中"],
+  statusUsedUp: ["Used up", "已用完"],
+  statusExpired: ["Expired", "已到期"],
+  statusMissing: ["No longer listed", "已不在列表"],
+  statusNotEffective: ["Not effective", "未生效"],
+  statusRefunded: ["Refunded", "已退款"],
+  ledgerEmpty: ["No ledger entries yet.", "还没有流水记录。"],
+  allUsers: ["All users", "所有用户"],
+  kindMigration: ["Opening balance", "期初余额"],
+  kindCredit: ["Package credited", "流量包入账"],
+  kindExpiry: ["Expired leftover", "到期清零"],
+  kindTransfer: ["Transfer", "转账"],
+  transferTo: ["to {0}", "转给 {0}"],
+  transferFrom: ["from {0}", "来自 {0}"],
+  modeLabel: ["Accounting", "统计方式"],
+  modeOffline: ["Offline", "离线统计"],
+  modeRemote: ["Remote sync", "远程同步"],
+  metering: ["Metering", "计量口径"],
+  meterMax: ["Larger direction per hour", "每小时入出取大"],
+  meterSum: ["Upload plus download", "上下行相加"],
+  meterDownload: ["Download only", "只算下行"],
+  modeHint: ["Offline splits the total quota locally. Remote sync keeps each user's balance matched to the provider's traffic packages.", "离线统计在本地平分总配额；远程同步按服务商的流量包维护每个用户的余额。"],
+  meterHint: ["Match the provider's billing. A relay whose traffic is billed outbound comes closest to upload plus download.", "按服务商的计费方式选择。按出向流量计费的公网中转，最接近“上下行相加”。"],
+  offlineTitle: ["Offline quota", "离线配额"],
+  provider: ["Provider", "服务商"],
+  accessKey: ["Access key", "AccessKey"],
+  secretKey: ["Secret key", "SecretKey"],
+  secretKept: ["set, leave empty to keep", "已设置，留空不修改"],
+  regions: ["Regions", "地域"],
+  regionsPlaceholder: ["e.g. cn-shanghai", "如 cn-shanghai"],
+  interval: ["Sync interval, s", "同步间隔(秒)"],
+  splitPackages: ["Packages split evenly", "平分的流量包"],
+  remoteHint: ["Only packages listed here or under a user are credited. Use a read-only sub-account key; it is stored in the panel file.", "只有写在这里或某个用户下的流量包才会入账。建议使用只读子账号的密钥，它会保存在面板文件中。"],
+  test: ["Test connection", "测试连接"],
+  testing: ["Testing", "测试中"],
+  testOk: ["{0} effective packages, {1} remaining.", "{0} 个生效中的流量包，剩余 {1}。"],
+  testIgnored: [" {0} in other regions not counted.", " 另有 {0} 个其他地域的包未计入。"],
 };
 const t = (key, ...args) => args.reduce((s, v, i) => s.replace("{" + i + "}", v), TEXT[key][zh ? 1 : 0]);
 const STOP = Symbol("stop");
@@ -235,15 +352,26 @@ const app = document.getElementById("app");
 let screen = "loading";
 let tab = "overview";
 let users = null;
+let accounting = null;
+let ledgerEntries = null;
+let ledgerUser = "";
 let lost = false;
 let draft = null;
 let revision = null;
 let source = "file";
+let secretSet = false;
 let dirty = false;
 let saving = false;
 let notice = null;
 let loginError = false;
 let canSignOut = true;
+let syncing = false;
+let crediting = false;
+let accountNotice = null;
+let packageNotice = null;
+let testState = null;
+const transferDraft = { from: "", to: "", amount: "" };
+const packageChoice = {};
 
 function h(tag, props, ...kids) {
   const el = document.createElement(tag);
@@ -264,6 +392,18 @@ function fmt(bytes) {
   return unit === 0 ? bytes + "B" : value.toFixed(2) + units[unit];
 }
 
+function signed(bytes, plus) {
+  return (bytes < 0 ? "−" : plus && bytes > 0 ? "+" : "") + fmt(Math.abs(bytes));
+}
+
+function when(seconds) {
+  return new Date(seconds * 1000).toLocaleString();
+}
+
+function list(text) {
+  return text.split(/[\s,，]+/).filter(Boolean);
+}
+
 async function call(method, path, body) {
   let response;
   try {
@@ -281,9 +421,19 @@ async function call(method, path, body) {
   return response;
 }
 
+async function failureText(response) {
+  const body = await response.json().catch(() => ({}));
+  return body.error || response.statusText;
+}
+
 function show(next) {
   screen = next;
   render();
+}
+
+function busyInput() {
+  const el = document.activeElement;
+  return el && app.contains(el) && /^(INPUT|SELECT|TEXTAREA)$/.test(el.tagName);
 }
 
 async function refresh() {
@@ -291,6 +441,7 @@ async function refresh() {
     const response = await call("GET", "status");
     const body = await response.json();
     users = body.users;
+    accounting = body.accounting;
     canSignOut = body.can_sign_out;
     lost = false;
   } catch (e) {
@@ -298,16 +449,21 @@ async function refresh() {
     lost = true;
   }
   if (screen !== "main") show("main");
-  else if (tab === "overview") render();
+  else if ((tab === "overview" || tab === "packages") && !busyInput()) render();
+  else if (tab === "ledger") { renderTop(); loadLedger(); }
   else renderTop();
 }
 
 function render() {
+  const shell = (...kids) => h("div", { class: "shell" }, topView(), kids);
   if (screen === "login") app.replaceChildren(loginView());
   else if (screen === "gone") app.replaceChildren(goneView());
   else if (screen === "loading") app.replaceChildren(h("div", { class: "door" }, h("p", null, t("loading"))));
-  else if (tab === "edit") app.replaceChildren(h("div", { class: "shell" }, topView(), editView()), saveBar());
-  else app.replaceChildren(h("div", { class: "shell" }, topView(), overviewView()));
+  else if (tab === "edit") app.replaceChildren(shell(editView()), saveBar());
+  else if (tab === "settings") app.replaceChildren(shell(settingsView()), saveBar());
+  else if (tab === "packages") app.replaceChildren(shell(packagesView()));
+  else if (tab === "ledger") app.replaceChildren(shell(ledgerView()));
+  else app.replaceChildren(shell(overviewView()));
 }
 
 function renderTop() {
@@ -348,44 +504,145 @@ function goneView() {
 
 function topView() {
   const go = (next) => () => {
-    if (next === "edit") openEdit(false);
-    else { tab = next; render(); refresh(); }
+    if (next === "edit" || next === "settings") { openDraft(next, false); return; }
+    tab = next;
+    render();
+    refresh();
   };
   const signOut = async () => {
     if (dirty && !confirm(t("discard") + "?")) return;
     try { await call("POST", "logout"); } catch (e) { if (e === STOP) return; }
-    draft = null; dirty = false; users = null;
+    draft = null; dirty = false; users = null; accounting = null; ledgerEntries = null;
     show("loading");
     refresh();
   };
+  const tabButton = (name) => h("button", {
+    class: "tab", "aria-current": tab === name ? "page" : null, onclick: go(name),
+  }, t(name));
   return h("header", { class: "top" },
     h("h1", { class: "brand" }, "ports-box"),
-    h("nav", { class: "tabs" },
-      h("button", { class: "tab", "aria-current": tab === "overview" ? "page" : null, onclick: go("overview") }, t("overview")),
-      h("button", { class: "tab", "aria-current": tab === "edit" ? "page" : null, onclick: go("edit") }, t("edit"))),
+    h("nav", { class: "tabs" }, ["overview", "packages", "ledger", "edit", "settings"].map(tabButton)),
     lost && h("span", { class: "lost", role: "status" }, t("lost")),
     canSignOut && h("button", { class: "plain", onclick: signOut }, t("signOut")));
 }
 
+function remoteActive() {
+  return accounting && accounting.mode === "remote" && accounting.migrated;
+}
+
 function overviewView() {
   if (!users) return h("p", { class: "empty" }, t("loading"));
-  if (!users.length) return h("p", { class: "empty" }, t("noUsers"));
-  return h("main", null, users.map(userView));
+  return h("main", null,
+    accountView(),
+    users.length ? users.map(userView) : h("p", { class: "empty" }, t("noUsers")));
+}
+
+function syncButton() {
+  return h("button", {
+    class: "plain", type: "button", disabled: syncing || !accounting || accounting.mode !== "remote", onclick: syncNow,
+  }, syncing ? t("syncing") : t("syncNow"));
+}
+
+function accountView() {
+  if (!accounting || accounting.mode !== "remote") return null;
+  const a = accounting;
+  const total = Object.values(a.balances).reduce((sum, value) => sum + value, 0);
+  const title = [t("remoteTitle"), a.provider === "volcengine" ? "Volcengine" : a.provider, a.regions.join(", ")]
+    .filter(Boolean).join(" · ");
+  return h("section", { class: "account" },
+    h("div", { class: "account-head" },
+      h("h2", { class: "account-title" }, title),
+      h("span", { class: "spent" }, a.synced_at ? t("lastSync", when(a.synced_at)) : t("neverSynced")),
+      syncButton()),
+    a.last_error && h("p", { class: "note error" }, t("syncFailed", a.last_error)),
+    a.migrated
+      ? h("p", { class: "facts" },
+        h("span", null, t("providerRemaining"), " ", h("b", null, fmt(a.remaining))),
+        h("span", null, t("balances"), " ", h("b", null, signed(total))),
+        h("span", null, t("unallocated"), " ", h("b", null, signed(a.unallocated))),
+        h("span", null, t("calibration", fmt(a.consumed), fmt(a.metered))))
+      : h("p", { class: "hint" }, t("waiting")),
+    a.migrated && transferView(),
+    accountNotice && h("p", { class: "note " + accountNotice.kind, role: "status" }, accountNotice.text));
+}
+
+function transferView() {
+  const names = (users || []).map((user) => user.name);
+  if (names.length < 2) return null;
+  if (!names.includes(transferDraft.from)) transferDraft.from = names[0];
+  if (!names.includes(transferDraft.to)) transferDraft.to = names[1];
+  const pick = (key, label) => {
+    const select = h("select", {
+      value: transferDraft[key],
+      onchange: () => { transferDraft[key] = select.value; },
+    }, names.map((name) => h("option", { value: name }, name)));
+    return h("label", { class: "field" }, h("span", null, label), select);
+  };
+  const amount = h("input", {
+    value: transferDraft.amount, placeholder: "10GB", spellcheck: "false", autocomplete: "off",
+    oninput: () => { transferDraft.amount = amount.value; },
+  });
+  return h("form", { class: "form-row transfer", onsubmit: submitTransfer },
+    pick("from", t("from")),
+    pick("to", t("to")),
+    h("label", { class: "field" }, h("span", null, t("amount")), amount),
+    h("button", { class: "plain" }, t("transfer")));
+}
+
+async function submitTransfer(event) {
+  event.preventDefault();
+  const amount = size(transferDraft.amount);
+  if (amount == null) return;
+  try {
+    const response = await call("POST", "transfer", { from: transferDraft.from, to: transferDraft.to, amount });
+    if (response.ok) {
+      transferDraft.amount = "";
+      accountNotice = { kind: "ok", text: t("transferDone") };
+    } else {
+      accountNotice = { kind: "error", text: await failureText(response) };
+    }
+  } catch (e) {
+    if (e === STOP) return;
+    accountNotice = { kind: "error", text: e.message };
+  }
+  document.activeElement.blur();
+  await refresh();
+  render();
+}
+
+async function syncNow() {
+  syncing = true;
+  accountNotice = null;
+  render();
+  try {
+    const response = await call("POST", "sync");
+    if (!response.ok) accountNotice = { kind: "error", text: await failureText(response) };
+  } catch (e) {
+    if (e === STOP) { syncing = false; return; }
+    accountNotice = { kind: "error", text: e.message };
+  }
+  syncing = false;
+  await refresh();
+  render();
 }
 
 function userView(user) {
+  const remote = remoteActive();
   const limited = user.limit_bytes != null;
   const share = limited && user.limit_bytes > 0 ? Math.min(1, user.used_bytes / user.limit_bytes) : limited ? 1 : 0;
   const level = user.exhausted ? " full" : share >= 0.9 ? " near" : "";
+  const spent = remote ? t("balanceLeft", user.remaining)
+    : limited ? t("usedOf", user.used, user.total) : t("usedOnly", user.used);
   return h("section", { class: "user" },
     h("div", { class: "user-head" },
       h("h2", { class: "user-name" }, user.name),
-      user.exhausted && h("span", { class: "flag" }, t("exhausted")),
-      h("span", { class: "spent" }, limited ? t("usedOf", user.used, user.total) : t("usedOnly", user.used))),
-    limited && h("div", { class: "meter" + level, role: "img", "aria-label": Math.round(share * 100) + "%" },
+      user.exhausted && h("span", { class: "flag" }, t(remote ? "noBalance" : "exhausted")),
+      h("span", { class: "spent" }, spent)),
+    limited && !remote && h("div", { class: "meter" + level, role: "img", "aria-label": Math.round(share * 100) + "%" },
       h("i", { style: "width:" + (share * 100).toFixed(2) + "%" })),
     h("p", { class: "facts" },
-      limited && h("span", null, t("remaining"), " ", h("b", null, user.remaining)),
+      limited && !remote && h("span", null, t("remaining"), " ", h("b", null, user.remaining)),
+      remote && h("span", null, t("billed"), " ", h("b", null, user.used)),
       h("span", null, t("thisHour"), " ", h("b", null, user.hour_used)),
       h("span", null, t("upload"), " ", h("b", null, fmt(user.upload_bytes))),
       h("span", null, t("download"), " ", h("b", null, fmt(user.download_bytes)))),
@@ -414,12 +671,164 @@ function routeView(rule) {
     h("span", { class: "label" }, rule.enabled ? rule.tag : [rule.tag, t("off")].filter(Boolean).join(", ")));
 }
 
+function statusText(status) {
+  const key = "status" + status;
+  return TEXT[key] ? t(key) : status;
+}
+
+function creditText(credit) {
+  if (credit.kind === "migration") return t("creditMigration");
+  if (credit.kind === "split") return t("creditSplit");
+  return t("creditUser", credit.user);
+}
+
+function creditCell(record) {
+  if (record.credit) return creditText(record.credit);
+  if (record.status !== "Effective") return h("span", { class: "dim" }, t("creditNone"));
+  const options = [["split", t("splitAll")]]
+    .concat((users || []).map((user) => ["user:" + user.name, t("giveTo", user.name)]));
+  if (!options.some(([value]) => value === packageChoice[record.id])) packageChoice[record.id] = "split";
+  const select = h("select", {
+    value: packageChoice[record.id],
+    onchange: () => { packageChoice[record.id] = select.value; },
+  }, options.map(([value, text]) => h("option", { value }, text)));
+  return h("div", { class: "credit" },
+    select,
+    h("button", {
+      class: "plain", type: "button", disabled: crediting,
+      onclick: () => creditPackage(record.id, packageChoice[record.id]),
+    }, crediting ? t("crediting") : t("credit")));
+}
+
+function packagesView() {
+  if (!accounting || !accounting.provider) return h("p", { class: "empty" }, t("packagesOff"));
+  const a = accounting;
+  const rank = (record) => (record.status === "Effective" ? 0 : 1);
+  const rows = a.packages.slice().sort((x, y) => rank(x) - rank(y) || x.expiry.localeCompare(y.expiry));
+  const head = ["colId", "colName", "colRegion", "colTotal", "colAvailable", "colExpiry", "colStatus", "colCredit"]
+    .map((key) => h("th", { class: key === "colTotal" || key === "colAvailable" ? "num" : null }, t(key)));
+  const row = (record) => h("tr", null,
+    h("td", { class: "mono" }, record.id),
+    h("td", null, record.name),
+    h("td", null, record.region),
+    h("td", { class: "num" }, fmt(record.total)),
+    h("td", { class: "num" }, fmt(record.available)),
+    h("td", null, record.expiry ? new Date(record.expiry).toLocaleDateString() : ""),
+    h("td", { class: record.status === "Effective" ? null : "dim" }, statusText(record.status)),
+    h("td", null, creditCell(record)));
+  return h("main", null,
+    h("div", { class: "account-head pad" },
+      h("span", { class: "hint" }, a.synced_at ? t("lastSync", when(a.synced_at)) : t("neverSynced")),
+      h("span", { class: "spent" }, syncButton())),
+    a.mode !== "remote" && h("p", { class: "hint" }, t("packagesIdle")),
+    a.last_error && h("p", { class: "note error" }, t("syncFailed", a.last_error)),
+    packageNotice && h("p", { class: "note " + packageNotice.kind, role: "status" }, packageNotice.text),
+    !a.migrated && a.mode === "remote" && h("p", { class: "hint" }, t("waiting")),
+    rows.length
+      ? h("div", { class: "table-wrap" }, h("table", { class: "table" }, h("thead", null, h("tr", null, head)), h("tbody", null, rows.map(row))))
+      : a.migrated && h("p", { class: "empty" }, t("noPackages", a.regions.join(", "))),
+    a.ignored.length > 0 && h("p", { class: "hint" }, t("ignoredPackages", a.ignored.length)));
+}
+
+async function creditPackage(id, choice) {
+  if (dirty && !confirm(t("discard") + "?")) return;
+  crediting = true;
+  packageNotice = null;
+  render();
+  try {
+    const response = await call("GET", "config");
+    const config = await response.json();
+    revision = config.revision;
+    source = config.source;
+    secretSet = config.secret_key_set;
+    draft = toDraft(config);
+    dirty = false;
+    notice = null;
+    if (choice === "split") {
+      draft.accounting.packages = list(draft.accounting.packages).concat(id).join(", ");
+    } else {
+      const user = draft.users.find((user) => "user:" + user.name === choice);
+      if (user) user.packages = list(user.packages).concat(id).join(", ");
+    }
+    const saved = await call("PUT", "config", fromDraft());
+    if (!saved.ok) {
+      packageNotice = { kind: "error", text: await failureText(saved) };
+    } else {
+      revision = (await saved.json()).revision;
+      source = "panel";
+      const synced = await call("POST", "sync");
+      packageNotice = synced.ok ? { kind: "ok", text: t("credited") } : { kind: "error", text: await failureText(synced) };
+    }
+    draft = null;
+  } catch (e) {
+    if (e === STOP) { crediting = false; return; }
+    packageNotice = { kind: "error", text: e.message };
+  }
+  crediting = false;
+  await refresh();
+  render();
+}
+
+async function loadLedger() {
+  try {
+    const response = await call("GET", "ledger");
+    ledgerEntries = await response.json();
+  } catch (e) {
+    if (e === STOP) return;
+    lost = true;
+    renderTop();
+    return;
+  }
+  if (tab === "ledger" && !busyInput()) render();
+}
+
+function kindText(kind) {
+  return t("kind" + kind[0].toUpperCase() + kind.slice(1));
+}
+
+function ledgerView() {
+  if (!ledgerEntries) { loadLedger(); return h("p", { class: "empty" }, t("loading")); }
+  const names = [...new Set(ledgerEntries.map((entry) => entry.user))].sort();
+  const filter = h("select", {
+    value: ledgerUser,
+    onchange: () => { ledgerUser = filter.value; render(); },
+  }, [["", t("allUsers")]].concat(names.map((name) => [name, name])).map(([value, text]) => h("option", { value }, text)));
+  const rows = ledgerEntries.filter((entry) => !ledgerUser || entry.user === ledgerUser);
+  const head = ["colTime", "colKind", "colUser", "colAmount", "colId", "colNote"]
+    .map((key) => h("th", { class: key === "colAmount" ? "num" : null }, t(key)));
+  const row = (entry) => h("tr", null,
+    h("td", { class: "dim" }, when(entry.time)),
+    h("td", null, kindText(entry.kind)),
+    h("td", null, entry.user),
+    h("td", { class: "num " + (entry.amount < 0 ? "minus" : "plus") }, signed(entry.amount, true)),
+    h("td", { class: "mono" }, entry.package || ""),
+    h("td", null, entry.kind === "transfer" ? t(entry.amount < 0 ? "transferTo" : "transferFrom", entry.note) : entry.note));
+  return h("main", null,
+    h("div", { class: "form-row pad" }, h("label", { class: "field filter" }, h("span", null, t("colUser")), filter)),
+    rows.length
+      ? h("div", { class: "table-wrap" }, h("table", { class: "table" }, h("thead", null, h("tr", null, head)), h("tbody", null, rows.map(row))))
+      : h("p", { class: "empty" }, t("ledgerEmpty")));
+}
+
 function toDraft(config) {
+  const accounting = config.accounting || {};
+  const remote = accounting.remote || {};
   return {
     total_quota: String(config.total_quota ?? ""),
+    accounting: {
+      mode: accounting.mode || "offline",
+      metering: accounting.metering || "max",
+      provider: remote.provider || "volcengine",
+      access_key: remote.access_key || "",
+      secret_key: "",
+      regions: (remote.regions || []).join(", "),
+      interval_secs: String(remote.interval_secs ?? 600),
+      packages: (remote.packages || []).join(", "),
+    },
     users: config.users.map((user) => ({
       name: user.name,
       quota: String(user.quota ?? ""),
+      packages: (user.packages || []).join(", "),
       rules: user.rules.map((rule) => ({
         listen: rule.listen,
         target: rule.target,
@@ -439,18 +848,37 @@ function size(text) {
   return /^\d+$/.test(value) ? Number(value) : value;
 }
 
+function remoteDraft() {
+  const a = draft.accounting;
+  return {
+    provider: a.provider,
+    access_key: a.access_key.trim(),
+    secret_key: a.secret_key,
+    regions: list(a.regions),
+    interval_secs: Number(a.interval_secs),
+    packages: list(a.packages),
+  };
+}
+
 function fromDraft() {
+  const a = draft.accounting;
+  const accounting = { mode: a.mode, metering: a.metering };
+  const remoteUsed = a.mode === "remote" || secretSet || a.secret_key
+    || a.access_key.trim() || a.regions.trim() || a.packages.trim();
+  if (remoteUsed) accounting.remote = remoteDraft();
   return {
     revision,
     total_quota: size(draft.total_quota),
+    accounting,
     users: draft.users.map((user) => ({
       name: user.name.trim(),
       quota: size(user.quota),
+      packages: list(user.packages),
       rules: user.rules.map((rule) => {
         const out = {
           listen: rule.listen.trim(),
           target: rule.target.trim(),
-          fallback: rule.fallback.split(/[\s,，]+/).filter(Boolean),
+          fallback: list(rule.fallback),
           protocol: rule.protocol,
           check_secs: Number(rule.check_secs),
           enabled: rule.enabled,
@@ -462,16 +890,18 @@ function fromDraft() {
   };
 }
 
-async function openEdit(force) {
+async function openDraft(next, force) {
   if (!draft || force) {
     try {
       const response = await call("GET", "config");
       const config = await response.json();
       revision = config.revision;
       source = config.source;
+      secretSet = config.secret_key_set;
       draft = toDraft(config);
       dirty = false;
       notice = null;
+      testState = null;
     } catch (e) {
       if (e === STOP) return;
       lost = true;
@@ -479,7 +909,7 @@ async function openEdit(force) {
       return;
     }
   }
-  tab = "edit";
+  tab = next;
   render();
 }
 
@@ -505,6 +935,14 @@ function field(label, object, key, extra) {
     oninput: () => { object[key] = input.value; touch(); },
   }, extra));
   return h("label", { class: "field" }, h("span", null, label), input);
+}
+
+function choice(label, object, key, options) {
+  const select = h("select", {
+    value: object[key],
+    onchange: () => { object[key] = select.value; touch(); },
+  }, options.map(([value, text]) => h("option", { value }, text)));
+  return h("label", { class: "field" }, h("span", null, label), select);
 }
 
 function ruleEditor(user, rule) {
@@ -534,6 +972,7 @@ function userEditor(user) {
     h("div", { class: "form-row" },
       field(t("name"), user, "name"),
       field(t("quota"), user, "quota", { placeholder: draft.total_quota.trim() ? t("quotaPlaceholder") : t("none") }),
+      field(t("userPackages"), user, "packages", { class: "mono", placeholder: t("fallbackPlaceholder") }),
       h("button", { class: "quiet", type: "button", onclick: () => change(() => draft.users.splice(draft.users.indexOf(user), 1)) }, t("removeUser"))),
     user.rules.map((rule) => ruleEditor(user, rule)),
     h("div", { class: "adders" },
@@ -543,12 +982,67 @@ function userEditor(user) {
 function editView() {
   return h("main", null,
     h("p", { class: "source" }, t(source === "panel" ? "fromPanel" : "fromFile")),
-    h("section", { class: "totals" },
-      h("div", { class: "form-row" }, field(t("totalQuota"), draft, "total_quota", { placeholder: t("none") })),
-      h("p", { class: "hint" }, t("totalHint"))),
     draft.users.map(userEditor),
     h("div", { class: "adders" },
-      h("button", { class: "plain", type: "button", onclick: () => change(() => draft.users.push({ name: "", quota: "", rules: [] })) }, t("addUser"))));
+      h("button", { class: "plain", type: "button", onclick: () => change(() => draft.users.push({ name: "", quota: "", packages: "", rules: [] })) }, t("addUser"))));
+}
+
+function testView() {
+  return h("p", { class: "test-result " + (testState ? testState.kind : ""), role: "status" }, testState ? testState.text : "");
+}
+
+function renderTest() {
+  const el = app.querySelector(".test-result");
+  if (el) el.replaceWith(testView());
+}
+
+async function testRemote() {
+  testState = { kind: "", text: t("testing") };
+  renderTest();
+  const remote = remoteDraft();
+  remote.interval_secs = remote.interval_secs || 600;
+  try {
+    const response = await call("POST", "remote/test", { remote });
+    if (response.ok) {
+      const body = await response.json();
+      testState = { kind: "ok", text: t("testOk", body.packages, fmt(body.remaining)) + (body.ignored ? t("testIgnored", body.ignored) : "") };
+    } else {
+      testState = { kind: "error", text: await failureText(response) };
+    }
+  } catch (e) {
+    if (e === STOP) return;
+    testState = { kind: "error", text: e.message };
+  }
+  renderTest();
+}
+
+function settingsView() {
+  const a = draft.accounting;
+  return h("main", null,
+    h("p", { class: "source" }, t(source === "panel" ? "fromPanel" : "fromFile")),
+    h("section", { class: "totals" },
+      h("div", { class: "form-row settings-row" },
+        choice(t("modeLabel"), a, "mode", [["offline", t("modeOffline")], ["remote", t("modeRemote")]]),
+        choice(t("metering"), a, "metering", [["max", t("meterMax")], ["sum", t("meterSum")], ["download", t("meterDownload")]])),
+      h("p", { class: "hint" }, t("modeHint")),
+      h("p", { class: "hint" }, t("meterHint"))),
+    h("section", { class: "totals" },
+      h("h2", { class: "section-title" }, t("offlineTitle")),
+      h("div", { class: "form-row" }, field(t("totalQuota"), draft, "total_quota", { placeholder: t("none") })),
+      h("p", { class: "hint" }, t("totalHint"))),
+    h("section", { class: "totals" },
+      h("h2", { class: "section-title" }, t("remoteTitle")),
+      h("div", { class: "form-row settings-row" },
+        choice(t("provider"), a, "provider", [["volcengine", "Volcengine"]]),
+        field(t("accessKey"), a, "access_key", { class: "mono" }),
+        field(t("secretKey"), a, "secret_key", { class: "mono", type: "password", autocomplete: "new-password", placeholder: secretSet ? t("secretKept") : "" }),
+        field(t("regions"), a, "regions", { class: "mono", placeholder: t("regionsPlaceholder") }),
+        field(t("interval"), a, "interval_secs", { type: "number", min: "60" }),
+        field(t("splitPackages"), a, "packages", { class: "mono", placeholder: t("fallbackPlaceholder") })),
+      h("p", { class: "hint" }, t("remoteHint")),
+      h("div", { class: "adders" },
+        h("button", { class: "plain", type: "button", onclick: testRemote }, t("test")),
+        testView())));
 }
 
 function saveBar() {
@@ -557,8 +1051,8 @@ function saveBar() {
   return h("footer", { class: "savebar" }, h("div", null,
     h("p", { class: kind === "ok" ? "ok" : kind ? "error" : "", role: "status" }, text),
     kind === "conflict"
-      ? h("button", { class: "plain", onclick: () => openEdit(true) }, t("reload"))
-      : h("button", { class: "plain", disabled: !dirty || saving, onclick: () => openEdit(true) }, t("discard")),
+      ? h("button", { class: "plain", onclick: () => openDraft(tab, true) }, t("reload"))
+      : h("button", { class: "plain", disabled: !dirty || saving, onclick: () => openDraft(tab, true) }, t("discard")),
     h("button", { class: "plain primary", disabled: !dirty || saving, onclick: saveConfig }, saving ? t("saving") : t("save"))));
 }
 
@@ -573,14 +1067,17 @@ async function saveConfig() {
   renderBar();
   try {
     const response = await call("PUT", "config", fromDraft());
-    const body = await response.json().catch(() => ({}));
     if (response.ok) {
+      const body = await response.json();
       revision = body.revision;
       source = "panel";
+      secretSet = secretSet || !!draft.accounting.secret_key;
+      draft.accounting.secret_key = "";
       dirty = false;
       notice = { kind: "ok", text: t("saved") };
+      if (tab === "settings") render();
     } else {
-      notice = { kind: response.status === 409 ? "conflict" : "error", text: body.error || response.statusText };
+      notice = { kind: response.status === 409 ? "conflict" : "error", text: await failureText(response) };
     }
   } catch (e) {
     if (e === STOP) { saving = false; return; }

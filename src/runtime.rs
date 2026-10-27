@@ -8,6 +8,7 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{Semaphore, mpsc, watch};
 use tracing::{info, warn};
 
+use crate::accounting::RemoteLimits;
 use crate::config::{self, Config, Protocol, format_size};
 use crate::pool::{self, TargetPool};
 use crate::quota::UserQuota;
@@ -102,17 +103,19 @@ pub struct Runtime {
     users: watch::Sender<Arc<UserSet>>,
     pools: watch::Sender<Arc<PoolMap>>,
     db: Option<Arc<StateDb>>,
+    remote: Arc<RemoteLimits>,
     permits: Arc<Semaphore>,
     started: bool,
 }
 
 impl Runtime {
-    pub fn new(db: Option<Arc<StateDb>>) -> Self {
+    pub fn new(db: Option<Arc<StateDb>>, remote: Arc<RemoteLimits>) -> Self {
         Self {
             rules: HashMap::new(),
             users: watch::Sender::new(Arc::default()),
             pools: watch::Sender::new(Arc::default()),
             db,
+            remote,
             permits: pool::probe_permits(),
             started: false,
         }
@@ -212,11 +215,28 @@ impl Runtime {
             _ => HashMap::new(),
         };
 
+        let metering = config.accounting.metering;
+        let remote = config
+            .accounting
+            .active_remote()
+            .and_then(|_| self.remote.snapshot());
+        let limit_of = |quota: &UserQuota| match &remote {
+            Some(limits) => Some(
+                limits
+                    .get(&quota.name)
+                    .copied()
+                    .unwrap_or_else(|| quota.used()),
+            ),
+            None => quotas[&quota.name],
+        };
         let mut ordered = Vec::with_capacity(config.users.len());
         for user in &config.users {
-            let limit = quotas[&user.name];
             let quota = match current.get(&user.name) {
                 Some(quota) => {
+                    if quota.metering() != metering {
+                        quota.set_metering(metering);
+                    }
+                    let limit = limit_of(quota);
                     if quota.limit() != limit {
                         info!(
                             user = %user.name,
@@ -231,7 +251,16 @@ impl Runtime {
                 }
                 None => {
                     let usage = saved.get(&user.name).copied().unwrap_or_default();
-                    let quota = Arc::new(UserQuota::new(user.name.clone(), limit, usage));
+                    let quota = Arc::new(UserQuota::new(
+                        user.name.clone(),
+                        quotas[&user.name],
+                        usage,
+                        metering,
+                    ));
+                    let limit = limit_of(&quota);
+                    if quota.limit() != limit {
+                        quota.set_limit(limit);
+                    }
                     log_quota(&quota);
                     quota
                 }
@@ -464,7 +493,7 @@ mod tests {
     async fn changed_target_takes_over_listening_socket() {
         let (a, b) = (tagged_server(b"a").await, tagged_server(b"b").await);
         let port = free_port();
-        let mut runtime = Runtime::new(None);
+        let mut runtime = Runtime::new(None, Arc::default());
         runtime.apply(&rules(&[(port, &a)])).await.unwrap();
         assert_eq!(greeting(port).await.unwrap().1, b"a");
 
@@ -477,7 +506,7 @@ mod tests {
     async fn removed_rule_closes_port_and_connections() {
         let a = tagged_server(b"a").await;
         let (kept, dropped) = (free_port(), free_port());
-        let mut runtime = Runtime::new(None);
+        let mut runtime = Runtime::new(None, Arc::default());
         runtime
             .apply(&rules(&[(kept, &a), (dropped, &a)]))
             .await
@@ -505,7 +534,7 @@ mod tests {
         let port = free_port();
         let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let busy_port = busy.local_addr().unwrap().port();
-        let mut runtime = Runtime::new(None);
+        let mut runtime = Runtime::new(None, Arc::default());
         runtime.apply(&rules(&[(port, &a)])).await.unwrap();
 
         let err = runtime
@@ -533,7 +562,7 @@ mod tests {
                 free_port(),
             ))
         };
-        let mut runtime = Runtime::new(None);
+        let mut runtime = Runtime::new(None, Arc::default());
         runtime.apply(&users(10)).await.unwrap();
         let before = runtime.users().borrow().get("a").unwrap().clone();
         assert!(!before.try_consume(10, Direction::Upload));
@@ -545,6 +574,44 @@ mod tests {
         assert!(Arc::ptr_eq(&before, &after));
         assert!(!after.is_exhausted());
         assert_eq!(after.remaining(), Some(990));
+    }
+
+    #[tokio::test]
+    async fn remote_mode_takes_limits_from_the_ledger() {
+        let (pa, pb) = (free_port(), free_port());
+        let config = |mode: &str, metering: &str| {
+            parse(&format!(
+                r#"{{
+                    "total_quota": 1000,
+                    "accounting": {{"mode": "{mode}", "metering": "{metering}", "remote": {{"provider": "volcengine", "access_key": "ak", "secret_key": "sk", "regions": ["r"]}}}},
+                    "users": [
+                        {{"name": "a", "rules": [{{"listen": "127.0.0.1:{pa}", "target": "x:1"}}]}},
+                        {{"name": "b", "rules": [{{"listen": "127.0.0.1:{pb}", "target": "x:1"}}]}}
+                    ]
+                }}"#
+            ))
+        };
+        let mut book = crate::ledger::Book {
+            migrated: true,
+            ..Default::default()
+        };
+        book.balances.insert("a".into(), 70);
+        book.baselines.insert("a".into(), 0);
+        let mut runtime = Runtime::new(None, RemoteLimits::new(&book));
+
+        runtime.apply(&config("remote", "max")).await.unwrap();
+
+        let users = runtime.users().borrow().clone();
+        assert_eq!(users.get("a").unwrap().limit(), Some(70));
+        assert_eq!(users.get("b").unwrap().limit(), Some(0));
+        assert!(users.get("b").unwrap().is_exhausted());
+
+        runtime.apply(&config("offline", "sum")).await.unwrap();
+
+        let a = runtime.users().borrow().get("a").unwrap().clone();
+        assert_eq!(a.limit(), Some(500));
+        assert_eq!(a.metering(), crate::config::Metering::Sum);
+        assert!(!runtime.users().borrow().get("b").unwrap().is_exhausted());
     }
 
     #[tokio::test]
@@ -561,7 +628,7 @@ mod tests {
         let only_a = parse(&format!(
             r#"{{"users": [{{"name": "a", "rules": [{{"listen": "127.0.0.1:{pa}", "target": "x:1"}}]}}]}}"#
         ));
-        let mut runtime = Runtime::new(Some(db));
+        let mut runtime = Runtime::new(Some(db), Arc::default());
         runtime.apply(&both).await.unwrap();
         runtime
             .users()

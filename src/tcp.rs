@@ -176,6 +176,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Metering;
     use crate::quota::SavedUsage;
     use crate::runtime::never_stop;
 
@@ -214,7 +215,12 @@ mod tests {
 
     #[tokio::test]
     async fn forwards_and_counts_both_directions() {
-        let quota = Arc::new(UserQuota::new("a".into(), None, SavedUsage::default()));
+        let quota = Arc::new(UserQuota::new(
+            "a".into(),
+            None,
+            SavedUsage::default(),
+            Metering::Max,
+        ));
         let addr = forwarder(vec![echo_server().await], quota.clone()).await;
         let mut stream = TcpStream::connect(addr).await.unwrap();
 
@@ -225,7 +231,12 @@ mod tests {
 
     #[tokio::test]
     async fn fails_over_to_fallback_target() {
-        let quota = Arc::new(UserQuota::new("a".into(), None, SavedUsage::default()));
+        let quota = Arc::new(UserQuota::new(
+            "a".into(),
+            None,
+            SavedUsage::default(),
+            Metering::Max,
+        ));
         let dead = {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             listener.local_addr().unwrap().to_string()
@@ -238,7 +249,12 @@ mod tests {
 
     #[tokio::test]
     async fn exhaustion_drops_live_and_new_connections() {
-        let quota = Arc::new(UserQuota::new("a".into(), Some(10), SavedUsage::default()));
+        let quota = Arc::new(UserQuota::new(
+            "a".into(),
+            Some(10),
+            SavedUsage::default(),
+            Metering::Max,
+        ));
         let addr = forwarder(vec![echo_server().await], quota.clone()).await;
         let mut stream = TcpStream::connect(addr).await.unwrap();
         roundtrip(&mut stream, b"12345").await;

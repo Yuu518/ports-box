@@ -16,6 +16,8 @@ pub struct Config {
     pub panel: Option<PanelConfig>,
     #[serde(default)]
     pub total_quota: Option<ByteSize>,
+    #[serde(default)]
+    pub accounting: Accounting,
     /// Single-user shorthand: top-level rules become a user named
     /// "default". Mutually exclusive with `users`.
     #[serde(default)]
@@ -78,12 +80,93 @@ impl PanelConfig {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Accounting {
+    #[serde(default)]
+    pub mode: Mode,
+    #[serde(default)]
+    pub metering: Metering,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteConfig>,
+}
+
+impl Accounting {
+    pub fn active_remote(&self) -> Option<&RemoteConfig> {
+        self.remote.as_ref().filter(|_| self.mode == Mode::Remote)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    #[default]
+    Offline,
+    Remote,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Metering {
+    #[default]
+    Max,
+    Sum,
+    Download,
+}
+
+impl Metering {
+    pub fn bill(self, upload: u64, download: u64) -> u64 {
+        match self {
+            Metering::Max => upload.max(download),
+            Metering::Sum => upload.saturating_add(download),
+            Metering::Download => download,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Provider {
+    Volcengine,
+}
+
+#[derive(Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteConfig {
+    pub provider: Provider,
+    #[serde(default)]
+    pub access_key: String,
+    #[serde(default)]
+    pub secret_key: String,
+    #[serde(default)]
+    pub regions: Vec<String>,
+    #[serde(default = "default_sync_secs")]
+    pub interval_secs: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub packages: Vec<String>,
+}
+
+impl fmt::Debug for RemoteConfig {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("RemoteConfig")
+            .field("provider", &self.provider)
+            .field("access_key", &self.access_key)
+            .field("secret_key", &"<redacted>")
+            .field("regions", &self.regions)
+            .field("interval_secs", &self.interval_secs)
+            .field("packages", &self.packages)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserConfig {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota: Option<ByteSize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub packages: Vec<String>,
     pub rules: Vec<Rule>,
 }
 
@@ -220,6 +303,12 @@ fn default_panel_path() -> PathBuf {
     PathBuf::from("panel.json")
 }
 
+fn default_sync_secs() -> u64 {
+    600
+}
+
+const MIN_SYNC_SECS: u64 = 60;
+
 /// A byte count that deserializes from either a plain integer (bytes) or a
 /// human-readable string like "500MB" / "10GB" / "1.5TB" (1024-based).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -337,6 +426,7 @@ fn finalize(mut config: Config) -> Result<Config, String> {
         config.users.push(UserConfig {
             name: "default".into(),
             quota: None,
+            packages: Vec::new(),
             rules: std::mem::take(&mut config.rules),
         });
     }
@@ -410,6 +500,43 @@ fn validate(config: &Config) -> Result<(), String> {
         }
     }
 
+    validate_accounting(config)
+}
+
+fn validate_accounting(config: &Config) -> Result<(), String> {
+    let accounting = &config.accounting;
+    let mut packages = HashSet::new();
+    let shared = accounting.remote.iter().flat_map(|remote| &remote.packages);
+    let owned = config.users.iter().flat_map(|user| &user.packages);
+    for id in shared.chain(owned) {
+        if id.trim().is_empty() {
+            return Err("traffic package id cannot be empty".into());
+        }
+        if !packages.insert(id) {
+            return Err(format!("traffic package {id:?} is listed more than once"));
+        }
+    }
+    if let Some(remote) = &accounting.remote {
+        if remote.interval_secs < MIN_SYNC_SECS {
+            return Err(format!(
+                "remote interval_secs must be at least {MIN_SYNC_SECS}"
+            ));
+        }
+        if remote.regions.iter().any(|region| region.trim().is_empty()) {
+            return Err("remote region cannot be empty".into());
+        }
+    }
+    if accounting.mode == Mode::Remote {
+        let Some(remote) = &accounting.remote else {
+            return Err("remote accounting needs a remote section".into());
+        };
+        if remote.access_key.is_empty() || remote.secret_key.is_empty() {
+            return Err("remote accounting needs access_key and secret_key".into());
+        }
+        if remote.regions.is_empty() {
+            return Err("remote accounting needs at least one region".into());
+        }
+    }
     Ok(())
 }
 
@@ -995,6 +1122,93 @@ users:
         })
         .unwrap_err();
         assert!(err.contains("no users or rules"), "{err}");
+    }
+
+    #[test]
+    fn accounting_defaults_to_offline_max() {
+        let config = parse_config(&format!("{{{RULE}}}")).unwrap();
+        assert_eq!(config.accounting, Accounting::default());
+        assert_eq!(config.accounting.mode, Mode::Offline);
+        assert_eq!(config.accounting.metering, Metering::Max);
+        assert!(config.accounting.active_remote().is_none());
+    }
+
+    #[test]
+    fn remote_accounting_parses() {
+        let config = parse_config(
+            r#"{
+                "accounting": {
+                    "mode": "remote",
+                    "metering": "sum",
+                    "remote": {
+                        "provider": "volcengine",
+                        "access_key": "ak",
+                        "secret_key": "sk",
+                        "regions": ["cn-shanghai"],
+                        "packages": ["tfp-a"]
+                    }
+                },
+                "users": [{"name": "a", "packages": ["tfp-b"], "rules": [{"listen": "0.0.0.0:1", "target": "x:1"}]}]
+            }"#,
+        )
+        .unwrap();
+        let remote = config.accounting.active_remote().unwrap();
+        assert_eq!(remote.provider, Provider::Volcengine);
+        assert_eq!(remote.interval_secs, 600);
+        assert_eq!(remote.packages, ["tfp-a"]);
+        assert_eq!(config.users[0].packages, ["tfp-b"]);
+        assert_eq!(config.accounting.metering, Metering::Sum);
+        assert!(!format!("{remote:?}").contains("sk\""), "{remote:?}");
+    }
+
+    #[test]
+    fn remote_accounting_is_validated() {
+        let remote = |mode: &str, remote: &str, user_packages: &str| {
+            parse_config(&format!(
+                r#"{{
+                    "accounting": {{"mode": "{mode}"{remote}}},
+                    "users": [{{"name": "a", "packages": [{user_packages}], "rules": [{{"listen": "0.0.0.0:1", "target": "x:1"}}]}}]
+                }}"#
+            ))
+        };
+        let full = r#", "remote": {"provider": "volcengine", "access_key": "ak", "secret_key": "sk", "regions": ["cn-shanghai"], "packages": ["p1"]}"#;
+        remote("remote", full, r#""p2""#).unwrap();
+        remote("offline", "", r#""p2""#).unwrap();
+        for (mode, section, packages, want) in [
+            ("remote", "", "", "needs a remote section"),
+            (
+                "remote",
+                r#", "remote": {"provider": "volcengine", "regions": ["cn-shanghai"]}"#,
+                "",
+                "access_key and secret_key",
+            ),
+            (
+                "remote",
+                r#", "remote": {"provider": "volcengine", "access_key": "ak", "secret_key": "sk"}"#,
+                "",
+                "at least one region",
+            ),
+            (
+                "offline",
+                r#", "remote": {"provider": "volcengine", "interval_secs": 5}"#,
+                "",
+                "interval_secs",
+            ),
+            ("remote", full, r#""p1""#, "more than once"),
+            ("offline", "", r#""""#, "cannot be empty"),
+        ] {
+            let err = remote(mode, section, packages).unwrap_err();
+            assert!(err.contains(want), "{mode} {section}: {err}");
+        }
+    }
+
+    #[test]
+    fn metering_bills_by_mode() {
+        assert_eq!(Metering::Max.bill(3, 5), 5);
+        assert_eq!(Metering::Sum.bill(3, 5), 8);
+        assert_eq!(Metering::Download.bill(3, 5), 5);
+        assert_eq!(Metering::Download.bill(9, 5), 5);
+        assert_eq!(Metering::Sum.bill(u64::MAX, 1), u64::MAX);
     }
 
     #[test]
