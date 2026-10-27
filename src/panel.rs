@@ -138,6 +138,10 @@ impl PanelState {
             .map(|session| (id.to_owned(), session.logged_in))
     }
 
+    fn passes_gate(&self, session: Option<&(String, bool)>) -> bool {
+        session.is_some() || !self.credentials.has_token()
+    }
+
     fn open_session(&self, logged_in: bool) -> String {
         let mut bytes = [0u8; 32];
         getrandom::fill(&mut bytes).expect("os random source unavailable");
@@ -258,12 +262,16 @@ fn enter(
     session: Option<&(String, bool)>,
     query: &HashMap<String, String>,
 ) -> Option<Response> {
-    let given = query.get("token")?;
+    let given = query
+        .get("token")
+        .filter(|_| state.credentials.has_token())?;
     if !token_matches(given, &state.credentials.token) {
         return None;
     }
     Some(redirect(
-        session.is_none().then(|| state.open_session(false)),
+        session
+            .is_none()
+            .then(|| state.open_session(!state.credentials.has_login())),
     ))
 }
 
@@ -276,9 +284,10 @@ async fn root(
     if let Some(response) = enter(&state, session.as_ref(), &query) {
         return response;
     }
-    match session {
-        Some(_) => redirect(None),
-        None => StatusCode::NOT_FOUND.into_response(),
+    if state.passes_gate(session.as_ref()) {
+        redirect(None)
+    } else {
+        StatusCode::NOT_FOUND.into_response()
     }
 }
 
@@ -291,19 +300,25 @@ async fn dashboard(
     if let Some(response) = enter(&state, session.as_ref(), &query) {
         return response;
     }
-    match session {
-        Some(_) => ([(header::CACHE_CONTROL, "no-store")], Html(PAGE)).into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
+    if state.passes_gate(session.as_ref()) {
+        ([(header::CACHE_CONTROL, "no-store")], Html(PAGE)).into_response()
+    } else {
+        StatusCode::NOT_FOUND.into_response()
     }
 }
 
 async fn guard(State(state): State<PanelState>, request: Request, next: Next) -> Response {
     let open = matches!(request.uri().path(), LOGIN | LOGOUT);
-    match state.session(request.headers()) {
-        None => StatusCode::NOT_FOUND.into_response(),
-        Some((_, false)) if !open => StatusCode::UNAUTHORIZED.into_response(),
-        Some(_) => next.run(request).await,
+    let session = state.session(request.headers());
+    if !state.passes_gate(session.as_ref()) {
+        return StatusCode::NOT_FOUND.into_response();
     }
+    let logged_in =
+        !state.credentials.has_login() || session.is_some_and(|(_, logged_in)| logged_in);
+    if !logged_in && !open {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    next.run(request).await
 }
 
 async fn login(
@@ -311,6 +326,9 @@ async fn login(
     headers: HeaderMap,
     Json(login): Json<Login>,
 ) -> Response {
+    if !state.credentials.has_login() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     let username = token_matches(&login.username, &state.credentials.username);
     let password = token_matches(&login.password, &state.credentials.password);
     if !(username & password) {
@@ -328,10 +346,13 @@ async fn login(
 }
 
 async fn logout(State(state): State<PanelState>, headers: HeaderMap) -> Response {
-    if let Some((id, _)) = state.session(&headers)
-        && let Some(session) = state.sessions.lock().unwrap().get_mut(&id)
-    {
-        session.logged_in = false;
+    if let Some((id, _)) = state.session(&headers) {
+        let mut sessions = state.sessions.lock().unwrap();
+        if !state.credentials.has_login() {
+            sessions.remove(&id);
+        } else if let Some(session) = sessions.get_mut(&id) {
+            session.logged_in = false;
+        }
     }
     StatusCode::NO_CONTENT.into_response()
 }
@@ -397,7 +418,8 @@ async fn status(State(state): State<PanelState>) -> Response {
             })
         })
         .collect();
-    Json(json!({ "users": users })).into_response()
+    let can_sign_out = state.credentials.has_token() || state.credentials.has_login();
+    Json(json!({ "users": users, "can_sign_out": can_sign_out })).into_response()
 }
 
 async fn get_config(State(state): State<PanelState>) -> Response {
@@ -495,8 +517,15 @@ mod tests {
         ]
     }"#;
 
+    const AUTH: &str = r#""token": "gate", "username": "admin", "password": "hunter2""#;
+
     fn test_app() -> (Router, mpsc::Receiver<SaveRequest>) {
-        let config = crate::config::parse(CONFIG, Path::new("config.json")).unwrap();
+        test_app_with(AUTH)
+    }
+
+    fn test_app_with(auth: &str) -> (Router, mpsc::Receiver<SaveRequest>) {
+        let config =
+            crate::config::parse(&CONFIG.replace(AUTH, auth), Path::new("config.json")).unwrap();
         let alice = Arc::new(UserQuota::new_at(
             "alice".into(),
             Some(1000),
@@ -679,6 +708,75 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    #[tokio::test]
+    async fn token_alone_signs_in() {
+        let (app, _saves) = test_app_with(r#""token": "gate""#);
+        for uri in ["/", DASHBOARD, "/dashboard/api/status"] {
+            let response = send(&app, "GET", uri, None, None).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
+        let session = enter_gate(&app).await;
+        let response = send(&app, "GET", "/dashboard/api/status", Some(&session), None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let login = json!({"username": "", "password": ""});
+        let response = send(&app, "POST", LOGIN, Some(&session), Some(login)).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = send(&app, "POST", LOGOUT, Some(&session), None).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let response = send(&app, "GET", "/dashboard/api/status", Some(&session), None).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn no_token_or_login_leaves_the_panel_open() {
+        let (app, _saves) = test_app_with("");
+        let response = send(&app, "GET", "/", None, None).await;
+        assert_eq!(response.status(), StatusCode::FOUND);
+        let response = send(&app, "GET", DASHBOARD, None, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = send(&app, "GET", "/dashboard/api/status", None, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["can_sign_out"], false);
+        let response = send(&app, "GET", "/dashboard/api/config", None, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let login = json!({"username": "", "password": ""});
+        let response = send(&app, "POST", LOGIN, None, Some(login)).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn credentials_alone_need_no_token() {
+        let (app, _saves) = test_app_with(r#""username": "admin", "password": "hunter2""#);
+        let response = send(&app, "GET", "/", None, None).await;
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert!(!response.headers().contains_key(header::SET_COOKIE));
+        let response = send(&app, "GET", DASHBOARD, None, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = send(&app, "GET", "/dashboard/api/status", None, None).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let response = send(&app, "GET", "/?token=", None, None).await;
+        assert!(!response.headers().contains_key(header::SET_COOKIE));
+
+        let wrong = json!({"username": "admin", "password": "wrong"});
+        let response = send(&app, "POST", LOGIN, None, Some(wrong)).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let right = json!({"username": "admin", "password": "hunter2"});
+        let response = send(&app, "POST", LOGIN, None, Some(right)).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let session = cookie_of(&response);
+        let response = send(&app, "GET", "/dashboard/api/status", Some(&session), None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = send(&app, "POST", LOGOUT, Some(&session), None).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let response = send(&app, "GET", "/dashboard/api/status", Some(&session), None).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn sessions_expire() {
         let (app, _saves) = test_app();
@@ -702,7 +800,7 @@ mod tests {
         let response = send(&app, "GET", "/dashboard/api/status", Some(&session), None).await;
         assert_eq!(
             body_json(response).await,
-            json!({"users": [{
+            json!({"can_sign_out": true, "users": [{
                 "name": "alice",
                 "total": "1000B",
                 "used": "200B",

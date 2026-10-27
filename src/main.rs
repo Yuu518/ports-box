@@ -182,6 +182,12 @@ async fn run(args: Args) -> Result<(), String> {
                 panel.listen
             );
         }
+        if !panel.has_token() && !panel.has_login() {
+            warn!(
+                "panel on {} has no token or login: anyone who can reach it can change users and rules, so keep it behind an authenticating proxy such as Cloudflare Access",
+                panel.listen
+            );
+        }
         let router = panel::router(
             panel,
             live.subscribe(),

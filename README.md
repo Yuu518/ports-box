@@ -9,7 +9,7 @@ A TCP/UDP port forwarder for Linux with per-user traffic quotas.
 - **Hard stop on quota exhaustion**: new connections are rejected, in-flight connections are closed immediately, UDP packets are dropped; service resumes as soon as the quota is raised in the config (no restart needed)
 - **Usage persistence (optional)**: with `state_file` configured, used traffic is stored in a SQLite database (flushed every 10 seconds by default and on exit), so counters survive restarts; without it, usage is kept in memory only and resets to zero on restart
 - **Config auto-reload**: edits to the config file are picked up automatically without a restart; an invalid config is rejected and the running one is kept (see "Config auto-reload" below)
-- **Web panel (optional, off by default)**: a built-in dashboard at `/dashboard` shows usage, rules, and target health, and edits users, rules, and quotas; it sits behind an entry token plus a username and password (see "Web panel" below)
+- **Web panel (optional, off by default)**: a built-in dashboard at `/dashboard` shows usage, rules, and target health, and edits users, rules, and quotas; it can sit behind an entry token, a username and password, both, or neither when an authenticating proxy such as Cloudflare Access guards it (see "Web panel" below)
 - **Query API**: an HTTP interface returns each user's total/used/remaining traffic; compatible with Sub-Store (`subscription-userinfo` response header)
 
 ## Build and run
@@ -206,7 +206,7 @@ users:
 |---|---|
 | `state_file` | Optional; omit the whole section to disable usage persistence (counters reset on restart). Subfields: `enabled` (default `true`, set `false` to disable temporarily), `path` (SQLite database path, default `state.db`, relative to the working directory), `flush_secs` (flush interval in seconds, default `10`) |
 | `api` | Optional; omit to not start the query API. `token` is also optional; when set, every request must carry the token |
-| `panel` | Optional; the web panel only starts when `enabled` is explicitly `true` (default `false`). Subfields: `listen` (default `127.0.0.1:8888`), `token` (entry token), `username`, `password` — these three are required once the panel is enabled — and `path` (where the panel stores its changes, default `panel.json`, relative to the working directory). See "Web panel" below |
+| `panel` | Optional; the web panel only starts when `enabled` is explicitly `true` (default `false`). Subfields: `listen` (default `127.0.0.1:8888`), `token` (entry token), `username`, `password` — all optional, but `username` and `password` go together — and `path` (where the panel stores its changes, default `panel.json`, relative to the working directory). See "Web panel" below |
 | `total_quota` | Optional; users without their own `quota` split this total evenly |
 | `rules` | Single-user shorthand: a top-level rule list, equivalent to a user named `default`; mutually exclusive with `users`. `rules` or `users` is required unless the panel is enabled |
 | `users[].quota` | Optional; this user's quota, taking precedence over the `total_quota` share. When neither `quota` nor `total_quota` is set, the user is unlimited |
@@ -255,11 +255,11 @@ With Docker, a single-file bind mount (`./config.json:/etc/ports-box/config.json
 
 ## Web panel
 
-The panel is off unless the config says `"panel": { "enabled": true, ... }`. It listens on `127.0.0.1:8888` by default and needs a `token`, a `username`, and a `password`; startup fails if any of the three is missing.
+The panel is off unless the config says `"panel": { "enabled": true, ... }`. It listens on `127.0.0.1:8888` by default and can use a `token`, a `username` and `password`, both, or neither; startup fails if only one of `username` and `password` is set. With neither, anyone who can reach the panel can change users and rules, so only do this behind an authenticating proxy such as Cloudflare Zero Trust (Access); a warning is logged at startup.
 
-1. Open `http://127.0.0.1:8888/?token=<token>`. A correct token redirects to `/dashboard`; without it every path on the panel port answers `404`, including `/dashboard` and the sign-in endpoint.
-2. Sign in with the username and password.
-3. For the next 7 days the browser can open `/dashboard` directly. Sessions live in memory, so a restart requires the token link and a new sign-in.
+1. With a `token`, open `http://127.0.0.1:8888/?token=<token>`. A correct token redirects to `/dashboard`; without it every path on the panel port answers `404`, including `/dashboard` and the sign-in endpoint. Without a `token`, open `http://127.0.0.1:8888/dashboard` directly.
+2. With a `username` and `password`, sign in with them. With a token alone, the token link signs you in. With neither, the dashboard opens straight away and has no sign-out button.
+3. For the next 7 days the browser can open `/dashboard` directly. Sessions live in memory, so a restart requires the token link or a new sign-in.
 
 **Overview** shows each user's quota, billed usage, current-hour usage, and raw upload/download, plus every rule with its targets: which one is in use, which are on standby, and which are down. It refreshes every 3 seconds.
 

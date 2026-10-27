@@ -243,6 +243,7 @@ let dirty = false;
 let saving = false;
 let notice = null;
 let loginError = false;
+let canSignOut = true;
 
 function h(tag, props, ...kids) {
   const el = document.createElement(tag);
@@ -288,7 +289,9 @@ function show(next) {
 async function refresh() {
   try {
     const response = await call("GET", "status");
-    users = (await response.json()).users;
+    const body = await response.json();
+    users = body.users;
+    canSignOut = body.can_sign_out;
     lost = false;
   } catch (e) {
     if (e === STOP) return;
@@ -352,7 +355,8 @@ function topView() {
     if (dirty && !confirm(t("discard") + "?")) return;
     try { await call("POST", "logout"); } catch (e) { if (e === STOP) return; }
     draft = null; dirty = false; users = null;
-    show("login");
+    show("loading");
+    refresh();
   };
   return h("header", { class: "top" },
     h("h1", { class: "brand" }, "ports-box"),
@@ -360,7 +364,7 @@ function topView() {
       h("button", { class: "tab", "aria-current": tab === "overview" ? "page" : null, onclick: go("overview") }, t("overview")),
       h("button", { class: "tab", "aria-current": tab === "edit" ? "page" : null, onclick: go("edit") }, t("edit"))),
     lost && h("span", { class: "lost", role: "status" }, t("lost")),
-    h("button", { class: "plain", onclick: signOut }, t("signOut")));
+    canSignOut && h("button", { class: "plain", onclick: signOut }, t("signOut")));
 }
 
 function overviewView() {

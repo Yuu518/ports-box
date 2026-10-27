@@ -68,6 +68,16 @@ pub struct PanelConfig {
     pub path: PathBuf,
 }
 
+impl PanelConfig {
+    pub fn has_token(&self) -> bool {
+        !self.token.is_empty()
+    }
+
+    pub fn has_login(&self) -> bool {
+        !self.username.is_empty() && !self.password.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserConfig {
@@ -351,16 +361,8 @@ fn validate(config: &Config) -> Result<(), String> {
         tcp_listens.insert(api.listen);
     }
     if let Some(panel) = config.panel() {
-        for (field, value) in [
-            ("token", &panel.token),
-            ("username", &panel.username),
-            ("password", &panel.password),
-        ] {
-            if value.is_empty() {
-                return Err(format!(
-                    "panel {field} must be set when the panel is enabled"
-                ));
-            }
+        if panel.username.is_empty() != panel.password.is_empty() {
+            return Err("panel username and password must be set together".into());
         }
         if !tcp_listens.insert(panel.listen) {
             return Err(format!("duplicate TCP listen address {}", panel.listen));
@@ -855,23 +857,36 @@ users:
     }
 
     #[test]
-    fn enabled_panel_requires_token_and_credentials() {
-        for (panel, missing) in [
+    fn panel_takes_a_token_credentials_both_or_neither() {
+        for (panel, token, login) in [
+            (r#"{"enabled": true}"#, false, false),
+            (
+                r#"{"enabled": true, "token": "", "username": "", "password": ""}"#,
+                false,
+                false,
+            ),
+            (r#"{"enabled": true, "token": "t"}"#, true, false),
             (
                 r#"{"enabled": true, "username": "u", "password": "p"}"#,
-                "token",
+                false,
+                true,
             ),
             (
-                r#"{"enabled": true, "token": "t", "password": "p"}"#,
-                "username",
-            ),
-            (
-                r#"{"enabled": true, "token": "t", "username": "u", "password": ""}"#,
-                "password",
+                r#"{"enabled": true, "token": "t", "username": "u", "password": "p"}"#,
+                true,
+                true,
             ),
         ] {
+            let config = parse_config(&format!(r#"{{"panel": {panel}, {RULE}}}"#)).unwrap();
+            let panel = config.panel().unwrap();
+            assert_eq!((panel.has_token(), panel.has_login()), (token, login));
+        }
+        for panel in [
+            r#"{"enabled": true, "token": "t", "password": "p"}"#,
+            r#"{"enabled": true, "username": "u", "password": ""}"#,
+        ] {
             let err = parse_config(&format!(r#"{{"panel": {panel}, {RULE}}}"#)).unwrap_err();
-            assert!(err.contains(&format!("panel {missing}")), "{err}");
+            assert!(err.contains("set together"), "{panel}: {err}");
         }
     }
 
