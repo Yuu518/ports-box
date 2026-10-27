@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::net::{TcpListener, UdpSocket};
+use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, mpsc, watch};
 use tracing::{info, warn};
 
@@ -89,13 +89,13 @@ struct RunningRule {
     _stop: watch::Sender<()>,
     pool: Arc<TargetPool>,
     tcp: Option<Arc<TcpListener>>,
-    udp: Option<Arc<UdpSocket>>,
+    udp: Option<Vec<Arc<udp::Endpoint>>>,
 }
 
 struct PreparedRule {
     spec: RuleSpec,
     tcp: Option<Arc<TcpListener>>,
-    udp: Option<Arc<UdpSocket>>,
+    udp: Option<Vec<Arc<udp::Endpoint>>>,
 }
 
 pub struct Runtime {
@@ -191,11 +191,10 @@ impl Runtime {
             let udp = match (spec.protocol.udp(), spare_udp.remove(&spec.listen)) {
                 (false, _) => None,
                 (true, Some(socket)) => Some(socket),
-                (true, None) => {
-                    Some(Arc::new(UdpSocket::bind(spec.listen).await.map_err(
-                        |e| format!("cannot bind udp {}: {e}", spec.listen),
-                    )?))
-                }
+                (true, None) => Some(
+                    udp::bind(spec.listen)
+                        .map_err(|e| format!("cannot bind udp {}: {e}", spec.listen))?,
+                ),
             };
             added.push(PreparedRule { spec, tcp, udp });
         }
@@ -346,8 +345,8 @@ impl Runtime {
                 stop.clone(),
             ));
         }
-        if let Some(socket) = &udp {
-            tokio::spawn(udp::serve(socket.clone(), pool.clone(), quota, stop));
+        if let Some(endpoints) = &udp {
+            tokio::spawn(udp::serve(endpoints.clone(), pool.clone(), quota, stop));
         }
         info!(user = %spec.user, "{}", spec.describe());
         self.rules.insert(

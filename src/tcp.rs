@@ -3,12 +3,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use socket2::{SockRef, TcpKeepalive};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
+use crate::pipe::Pipe;
 use crate::pool::{CONNECT_TIMEOUT, TargetPool};
 use crate::quota::{Direction, UserQuota, exhausted};
 use crate::runtime::stopped;
@@ -148,19 +150,42 @@ async fn handle(
     }
 }
 
-async fn copy_counted<R, W>(
-    mut reader: R,
-    mut writer: W,
+async fn copy_counted(
+    mut reader: OwnedReadHalf,
+    mut writer: OwnedWriteHalf,
     quota: &UserQuota,
     direction: Direction,
-) -> io::Result<()>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut buf = vec![0u8; COPY_BUF];
+) -> io::Result<()> {
+    let mut pipe: Option<Pipe> = None;
+    let mut can_splice = true;
+    let mut buf = Vec::new();
     loop {
-        let n = reader.read(&mut buf).await?;
+        reader.as_ref().readable().await?;
+        if pipe.is_none() && can_splice {
+            pipe = Pipe::acquire();
+            can_splice = pipe.is_some();
+        }
+        let n = match &pipe {
+            Some(p) => {
+                let src = reader.as_ref();
+                match src.try_io(Interest::READABLE, || p.fill_from(src)) {
+                    Ok(n) => n,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        if let Some(p) = pipe.take() {
+                            p.release();
+                        }
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            None => {
+                if buf.is_empty() {
+                    buf = vec![0u8; COPY_BUF];
+                }
+                reader.read(&mut buf).await?
+            }
+        };
         if n == 0 {
             // Propagate EOF as a half-close and let the other direction run on.
             let _ = writer.shutdown().await;
@@ -169,7 +194,22 @@ where
         if !quota.try_consume(n as u64, direction) {
             return Err(io::Error::other("quota exhausted"));
         }
-        writer.write_all(&buf[..n]).await?;
+        match &pipe {
+            Some(p) => {
+                let dst = writer.as_ref();
+                let mut left = n;
+                while left > 0 {
+                    let sent = dst
+                        .async_io(Interest::WRITABLE, || p.drain_to(dst, left))
+                        .await?;
+                    if sent == 0 {
+                        return Err(io::ErrorKind::WriteZero.into());
+                    }
+                    left -= sent;
+                }
+            }
+            None => writer.write_all(&buf[..n]).await?,
+        }
     }
 }
 
@@ -227,6 +267,68 @@ mod tests {
         roundtrip(&mut stream, b"hello").await;
 
         assert_eq!((quota.upload(), quota.download()), (5, 5));
+    }
+
+    #[tokio::test]
+    async fn forwards_bulk_data_intact() {
+        let quota = Arc::new(UserQuota::new(
+            "a".into(),
+            None,
+            SavedUsage::default(),
+            Metering::Max,
+        ));
+        let addr = forwarder(vec![echo_server().await], quota.clone()).await;
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let payload: Vec<u8> = (0..8 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+        let (mut r, mut w) = stream.into_split();
+
+        let sent = payload.clone();
+        let writer = tokio::spawn(async move {
+            w.write_all(&sent).await.unwrap();
+            w.shutdown().await.unwrap();
+        });
+        let mut received = Vec::new();
+        timeout(Duration::from_secs(30), r.read_to_end(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        writer.await.unwrap();
+
+        assert!(received == payload);
+        let len = payload.len() as u64;
+        assert_eq!((quota.upload(), quota.download()), (len, len));
+    }
+
+    #[tokio::test]
+    async fn half_close_keeps_other_direction_open() {
+        let quota = Arc::new(UserQuota::new(
+            "a".into(),
+            None,
+            SavedUsage::default(),
+            Metering::Max,
+        ));
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = upstream.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).await.unwrap();
+            stream.write_all(&request).await.unwrap();
+            stream.write_all(b" done").await.unwrap();
+        });
+        let addr = forwarder(vec![target], quota).await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+
+        stream.write_all(b"request").await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut reply = Vec::new();
+        timeout(Duration::from_secs(5), stream.read_to_end(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(reply, b"request done");
+        server.await.unwrap();
     }
 
     #[tokio::test]

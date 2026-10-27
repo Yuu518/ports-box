@@ -4,6 +4,7 @@ mod config;
 mod dns;
 mod ledger;
 mod panel;
+mod pipe;
 mod pool;
 mod provider;
 mod quota;

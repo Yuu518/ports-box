@@ -28,7 +28,7 @@ cargo build --release
 
 The log level is controlled via `RUST_LOG` (default `ports_box=info`). On SIGTERM / SIGINT, usage is written to the database before exiting.
 
-Every forwarded TCP connection holds two file descriptors and every UDP session one, so at startup the process raises its soft open-file limit (`RLIMIT_NOFILE`) to the hard limit. The bundled systemd unit sets `LimitNOFILE=1048576`.
+Every forwarded TCP connection holds two file descriptors, plus two more per direction that is actively moving data (the splice pipe, see "Performance"), and every UDP session one; at startup the process raises its soft open-file limit (`RLIMIT_NOFILE`) to the hard limit. The bundled systemd unit sets `LimitNOFILE=1048576`.
 
 ## Docker image
 
@@ -384,6 +384,30 @@ journalctl -u ports-box -f      # follow logs
 
 Config changes (rules, quotas) are applied automatically, see "Config auto-reload"; changes to `api` / `panel` / `state_file` need `systemctl restart ports-box`;
 stopping/restarting writes usage to `state.db` first, so no counters are lost.
+
+## Performance
+
+On Linux the data path uses kernel features while keeping byte-exact accounting and the instant hard stop:
+
+- **TCP zero-copy**: data moves socket → pipe → socket with `splice(2)` and never enters user space. A pipe is borrowed only while a direction is moving data and returned to a small per-thread pool when it goes idle, so idle connections hold none. When no pipe of at least 64 KiB can be created (for example once the process user passes `fs.pipe-user-pages-soft`), that direction falls back to a plain 64 KiB buffer copy.
+- **UDP on every core**: each UDP listen port opens one socket per CPU (up to 8) with `SO_REUSEPORT`; the kernel hashes each client to a fixed socket, so every socket keeps its own sessions without lock contention. A side effect is that a second ports-box process running as the same user can bind the same UDP port and silently share its traffic instead of failing with "address in use".
+- **UDP batching**: packets are received in batches (`recvmmsg`) with UDP GRO, and coalesced packets are sent back out with UDP GSO, keeping the original datagram boundaries; if the NIC or path rejects GSO, the packets are sent one by one. IP fragmentation behaviour is left at the kernel default.
+- **Socket buffers**: UDP sockets ask for 4 MiB send and receive buffers; the kernel caps the request at `net.core.wmem_max` / `net.core.rmem_max`.
+
+Suggested sysctls for high-traffic hosts:
+
+```sh
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.core.rmem_max = 4194304
+net.core.wmem_max = 4194304
+net.ipv4.tcp_rmem = 4096 131072 33554432
+net.ipv4.tcp_wmem = 4096 65536 33554432
+net.core.netdev_max_backlog = 16384
+net.core.somaxconn = 4096
+```
+
+Other platforms use the same code paths with a buffer copy for TCP and a single UDP socket per port.
 
 ---
 
