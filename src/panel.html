@@ -171,6 +171,7 @@ button, input, select { font: inherit; color: inherit; }
 .transfer .field { flex: 0 1 11rem; }
 .section-title { font-size: 1rem; font-weight: 650; margin: 0 0 0.75rem; }
 .settings-row .field { flex: 1 1 13rem; }
+.mode-row .field { flex: 0 1 calc(50% - 0.5rem); min-width: 13rem; }
 .test-result { margin: 0; align-self: center; }
 .pad { padding: 1.25rem 0 0.75rem; }
 .table-wrap { overflow-x: auto; margin-top: 0.75rem; }
@@ -279,7 +280,10 @@ const TEXT = {
   check: ["Check, s", "检查间隔(秒)"],
   addRule: ["Add rule", "添加规则"],
   addUser: ["Add user", "添加用户"],
-  userMode: ["Mode", "模式"],
+  userMode: ["User mode", "用户模式"],
+  rules: ["Rules", "规则"],
+  modeInSettings: ["Single-user or multi-user mode is chosen under Settings.", "单用户/多用户模式在“设置”中切换。"],
+  creditAuto: ["Credited on the next sync", "下次同步时自动入账"],
   modeMulti: ["Multiple users", "多用户"],
   modeSingle: ["Single user (exclusive)", "单用户（独享）"],
   multiHint: ["Each user has their own rules and their own quota or balance.", "每个用户有自己的规则，以及各自的配额或余额。"],
@@ -493,6 +497,7 @@ async function refresh() {
     accounting = body.accounting;
     canSignOut = body.can_sign_out;
     singleUser = body.single_user;
+    if (singleUser && tab === "ledger") tab = "overview";
     lost = false;
   } catch (e) {
     if (e === STOP) return;
@@ -568,10 +573,13 @@ function topView() {
   };
   const tabButton = (name) => h("button", {
     class: "tab", "aria-current": tab === name ? "page" : null, onclick: go(name),
-  }, t(name));
+  }, t(name === "edit" && singleUser ? "rules" : name));
+  const tabs = singleUser
+    ? ["overview", "packages", "edit", "settings"]
+    : ["overview", "packages", "ledger", "edit", "settings"];
   return h("header", { class: "top" },
     h("h1", { class: "brand" }, "ports-box"),
-    h("nav", { class: "tabs" }, ["overview", "packages", "ledger", "edit", "settings"].map(tabButton)),
+    h("nav", { class: "tabs" }, tabs.map(tabButton)),
     lost && h("span", { class: "lost", role: "status" }, t("lost")),
     canSignOut && h("button", { class: "plain", onclick: signOut }, t("signOut")));
 }
@@ -605,15 +613,16 @@ function accountView() {
       h("span", { class: "spent" }, a.synced_at ? t("lastSync", when(a.synced_at)) : t("neverSynced")),
       syncButton()),
     a.last_error && h("p", { class: "note error" }, t("syncFailed", a.last_error)),
-    a.migrated
-      ? h("p", { class: "facts" },
-        h("span", null, t("providerRemaining"), " ", h("b", null, fmt(a.remaining))),
-        h("span", null, t("balances"), " ", h("b", null, signed(total))),
-        h("span", null, t("unallocated"), " ", h("b", null, signed(a.unallocated))),
-        h("span", null, t("calibration", fmt(a.consumed), fmt(a.metered))))
-      : h("p", { class: "hint" }, t("waiting")),
-    a.migrated && a.unallocated > 0 && allocateView(),
-    a.migrated && transferView(),
+    !a.migrated && h("p", { class: "hint" }, t("waiting")),
+    a.migrated && singleUser && h("p", { class: "facts" },
+      h("span", null, t("providerRemaining"), " ", h("b", null, fmt(a.remaining)))),
+    a.migrated && !singleUser && h("p", { class: "facts" },
+      h("span", null, t("providerRemaining"), " ", h("b", null, fmt(a.remaining))),
+      h("span", null, t("balances"), " ", h("b", null, signed(total))),
+      h("span", null, t("unallocated"), " ", h("b", null, signed(a.unallocated))),
+      h("span", null, t("calibration", fmt(a.consumed), fmt(a.metered)))),
+    a.migrated && !singleUser && a.unallocated > 0 && allocateView(),
+    a.migrated && !singleUser && transferView(),
     accountNotice && h("p", { class: "note " + accountNotice.kind, role: "status" }, accountNotice.text));
 }
 
@@ -779,6 +788,7 @@ function creditText(credit) {
 function creditCell(record) {
   if (record.credit) return creditText(record.credit);
   if (record.status !== "Effective") return h("span", { class: "dim" }, t("creditNone"));
+  if (singleUser) return h("span", { class: "dim" }, t("creditAuto"));
   const options = [["split", t("splitAll")]]
     .concat(singleUser ? [] : (users || []).map((user) => ["user:" + user.name, t("giveTo", user.name)]));
   if (!options.some(([value]) => value === packageChoice[record.id])) packageChoice[record.id] = "split";
@@ -1188,15 +1198,14 @@ function modeView() {
     },
   }, [["multi", t("modeMulti")], ["single", t("modeSingle")]].map(([value, text]) => h("option", { value }, text)));
   return h("section", { class: "totals" },
-    h("div", { class: "form-row" }, h("label", { class: "field" }, h("span", null, t("userMode")), select)),
+    h("div", { class: "form-row mode-row" }, h("label", { class: "field" }, h("span", null, t("userMode")), select)),
     h("p", { class: "hint" }, t(draft.single_user ? "singleHint" : "multiHint")),
     modeError && h("p", { class: "note error", role: "alert" }, t("singleTooMany")));
 }
 
 function editView() {
   return h("main", null,
-    h("p", { class: "source" }, t(source === "panel" ? "fromPanel" : "fromFile")),
-    modeView(),
+    h("p", { class: "source" }, t(source === "panel" ? "fromPanel" : "fromFile"), " ", t("modeInSettings")),
     draft.single_user
       ? singleEditor()
       : [
@@ -1258,6 +1267,7 @@ function settingsView() {
   const a = draft.accounting;
   return h("main", null,
     h("p", { class: "source" }, t(source === "panel" ? "fromPanel" : "fromFile")),
+    modeView(),
     h("section", { class: "totals" },
       h("div", { class: "form-row settings-row" },
         choice(t("modeLabel"), a, "mode", [["offline", t("modeOffline")], ["remote", t("modeRemote")]]),
@@ -1317,6 +1327,7 @@ async function saveConfig() {
       rememberConnection();
       dirty = false;
       notice = { kind: "ok", text: t("saved") };
+      refresh();
       if (tab === "settings") render();
     } else {
       notice = { kind: response.status === 409 ? "conflict" : "error", text: await failureText(response) };
