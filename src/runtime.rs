@@ -54,10 +54,6 @@ impl UserSet {
     pub fn get(&self, name: &str) -> Option<&Arc<UserQuota>> {
         self.by_name.get(name)
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.ordered.is_empty()
-    }
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -107,6 +103,7 @@ pub struct Runtime {
     pools: watch::Sender<Arc<PoolMap>>,
     db: Option<Arc<StateDb>>,
     permits: Arc<Semaphore>,
+    started: bool,
 }
 
 impl Runtime {
@@ -117,6 +114,7 @@ impl Runtime {
             pools: watch::Sender::new(Arc::default()),
             db,
             permits: pool::probe_permits(),
+            started: false,
         }
     }
 
@@ -130,7 +128,7 @@ impl Runtime {
 
     pub async fn apply(&mut self, config: &Config) -> Result<(), String> {
         let current = self.users.borrow().clone();
-        let first = current.is_empty() && self.rules.is_empty();
+        let first = !self.started;
         let quotas = config::resolve_quotas(config);
 
         let mut specs = Vec::new();
@@ -290,6 +288,7 @@ impl Runtime {
                 self.rules.len() - added_count,
             );
         }
+        self.started = true;
         Ok(())
     }
 

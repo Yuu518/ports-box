@@ -142,6 +142,9 @@ async fn run(args: Args) -> Result<(), String> {
     let effective = stored.unwrap_or_else(|| config.clone());
     let mut runtime = Runtime::new(db.as_ref().map(|(db, _)| db.clone()));
     runtime.apply(&effective).await?;
+    if effective.users.is_empty() {
+        info!("no users configured yet; add them from the panel");
+    }
 
     if let Some(api) = &config.api {
         let listener = TcpListener::bind(api.listen)

@@ -208,7 +208,7 @@ users:
 | `api` | Optional; omit to not start the query API. `token` is also optional; when set, every request must carry the token |
 | `panel` | Optional; the web panel only starts when `enabled` is explicitly `true` (default `false`). Subfields: `listen` (default `127.0.0.1:8888`), `token` (entry token), `username`, `password` — these three are required once the panel is enabled — and `path` (where the panel stores its changes, default `panel.json`, relative to the working directory). See "Web panel" below |
 | `total_quota` | Optional; users without their own `quota` split this total evenly |
-| `rules` | Single-user shorthand: a top-level rule list, equivalent to a user named `default`; mutually exclusive with `users` |
+| `rules` | Single-user shorthand: a top-level rule list, equivalent to a user named `default`; mutually exclusive with `users`. `rules` or `users` is required unless the panel is enabled |
 | `users[].quota` | Optional; this user's quota, taking precedence over the `total_quota` share. When neither `quota` nor `total_quota` is set, the user is unlimited |
 | `rules[].listen` | Listen address (`IP:port`) |
 | `rules[].target` | Forwarding target (`host:port`, domain names supported — see "Domain name resolution" below) |
@@ -265,6 +265,7 @@ The panel is off unless the config says `"panel": { "enabled": true, ... }`. It 
 
 **Users and rules** edits `total_quota`, users, quotas, and rules. Saving validates the result, binds any new ports, and applies it immediately (it works with `--no-reload` too); if anything fails, nothing changes and the error is shown. Things to know:
 
+- With the panel enabled, the config file may leave out `users` and `rules` entirely: the process starts with nothing forwarded, and users and rules are added from the panel.
 - Saving **never touches the config file**. The panel keeps its changes in its own store, `panel.path` (default `panel.json`, relative to the working directory), and they survive restarts.
 - **Editing the config file takes over again.** Whoever changed things last wins: as soon as the config file's content changes — while running, or while the process was stopped — the file is used as written, the panel's saved changes are dropped, and `panel.json` is deleted. Any change to the file counts, even one outside `users` and `total_quota`.
 - If a changed config file is rejected (syntax error, port in use, …), the running config, including the panel's changes, stays in effect until the file is fixed.

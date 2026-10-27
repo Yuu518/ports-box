@@ -335,8 +335,8 @@ fn finalize(mut config: Config) -> Result<Config, String> {
 }
 
 fn validate(config: &Config) -> Result<(), String> {
-    if config.users.is_empty() {
-        return Err("config has no users or rules".into());
+    if config.users.is_empty() && config.panel().is_none() {
+        return Err("config has no users or rules; add some or enable the panel".into());
     }
     if let Some(state) = &config.state_file
         && state.flush_secs == 0
@@ -732,6 +732,19 @@ mod tests {
     fn empty_config_is_error() {
         let err = parse_config(r#"{}"#).unwrap_err();
         assert!(err.contains("no users or rules"), "{err}");
+        let err = parse_config(r#"{"panel": {"token": "t", "username": "u", "password": "p"}}"#)
+            .unwrap_err();
+        assert!(err.contains("no users or rules"), "{err}");
+    }
+
+    #[test]
+    fn enabled_panel_allows_empty_users() {
+        let config = parse_config(
+            r#"{"panel": {"enabled": true, "token": "t", "username": "u", "password": "p"}}"#,
+        )
+        .unwrap();
+        assert!(config.users.is_empty());
+        assert!(config.panel().is_some());
     }
 
     #[test]
@@ -954,8 +967,15 @@ users:
         })
         .unwrap_err();
         assert!(err.contains("duplicate TCP"), "{err}");
+        let emptied = check(Config {
+            users: Vec::new(),
+            ..config.clone()
+        })
+        .unwrap();
+        assert!(emptied.users.is_empty());
         let err = check(Config {
             users: Vec::new(),
+            panel: None,
             ..config
         })
         .unwrap_err();
