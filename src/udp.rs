@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::num::NonZero;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use quinn_udp::{RecvMeta, Transmit, UdpSocketState};
 use socket2::SockRef;
@@ -13,7 +13,7 @@ use tokio::io::Interest;
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout};
 use tracing::{debug, warn};
 
 use crate::pool::{CONNECT_TIMEOUT, TargetPool};
@@ -21,7 +21,7 @@ use crate::quota::{Direction, UserQuota, exhausted};
 use crate::runtime::stopped;
 
 const RECV_BUF: usize = 64 * 1024;
-const RECV_BATCH: usize = 4;
+const RECV_BATCH: usize = 16;
 const SOCKET_BUF: usize = 4 * 1024 * 1024;
 const MAX_SHARDS: usize = 8;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -226,12 +226,19 @@ struct Relay {
     pool: Arc<TargetPool>,
     quota: Arc<UserQuota>,
     max_sessions: usize,
+    idle_timeout: Duration,
     stop: watch::Receiver<()>,
 }
 
 impl Relay {
     fn now_ms(&self) -> u64 {
         self.epoch.elapsed().as_millis() as u64
+    }
+
+    fn idle_deadline(&self, session: &Session) -> Instant {
+        self.epoch
+            + Duration::from_millis(session.last_active.load(Ordering::Relaxed))
+            + self.idle_timeout
     }
 
     async fn forward(&self, session: &Session, data: &[u8], stride: usize) -> io::Result<()> {
@@ -302,7 +309,7 @@ pub async fn serve(
     quota: Arc<UserQuota>,
     stop: watch::Receiver<()>,
 ) {
-    serve_with_limit(endpoints, pool, quota, stop, MAX_SESSIONS).await
+    serve_with_limit(endpoints, pool, quota, stop, MAX_SESSIONS, IDLE_TIMEOUT).await
 }
 
 async fn serve_with_limit(
@@ -311,6 +318,7 @@ async fn serve_with_limit(
     quota: Arc<UserQuota>,
     stop: watch::Receiver<()>,
     max_sessions: usize,
+    idle_timeout: Duration,
 ) {
     let per_shard = max_sessions.div_ceil(endpoints.len().max(1));
     let mut shards = JoinSet::new();
@@ -322,6 +330,7 @@ async fn serve_with_limit(
             pool: pool.clone(),
             quota: quota.clone(),
             max_sessions: per_shard,
+            idle_timeout,
             stop: stop.clone(),
         })));
     }
@@ -449,32 +458,35 @@ async fn relay_downstream(relay: Arc<Relay>, session: Arc<Session>, peer: Socket
     let mut storage = vec![0u8; RECV_BUF];
     let mut bufs = [IoSliceMut::new(&mut storage)];
     let mut meta = [RecvMeta::default()];
+    let idle = tokio::time::sleep_until(relay.idle_deadline(&session));
+    let drained = exhausted(quota.subscribe());
+    let removed = stopped(relay.stop.clone());
+    let moved = active_moved(&mut active_rx, session.target_index);
+    tokio::pin!(idle, drained, removed, moved);
     loop {
         let received = tokio::select! {
-            r = timeout(IDLE_TIMEOUT, session.upstream.recv(&mut bufs, &mut meta)) => r,
-            _ = exhausted(quota.subscribe()) => break,
-            _ = stopped(relay.stop.clone()) => break,
-            _ = active_moved(&mut active_rx, session.target_index) => {
+            r = session.upstream.recv(&mut bufs, &mut meta) => r,
+            () = &mut idle => {
+                let deadline = relay.idle_deadline(&session);
+                if deadline <= Instant::now() {
+                    break;
+                }
+                idle.as_mut().reset(deadline);
+                continue;
+            }
+            () = &mut drained => break,
+            () = &mut removed => break,
+            () = &mut moved => {
                 debug!(user = %quota.name, %peer, "udp session ended: active target changed");
                 break;
             }
         };
         match received {
-            Err(_) => {
-                // No reply within the window; the client side may still be
-                // active (its packets flow through the main loop).
-                let idle = relay
-                    .now_ms()
-                    .saturating_sub(session.last_active.load(Ordering::Relaxed));
-                if idle >= IDLE_TIMEOUT.as_millis() as u64 {
-                    break;
-                }
-            }
-            Ok(Err(e)) => {
+            Err(e) => {
                 debug!(user = %quota.name, %peer, "udp session closed: {e}");
                 break;
             }
-            Ok(Ok(_)) => {
+            Ok(_) => {
                 // A reply from upstream is proof the target is alive: the
                 // strongest health signal UDP can produce.
                 relay.pool.confirm(session.target_index);
@@ -544,7 +556,7 @@ mod tests {
         quota: Arc<UserQuota>,
         max_sessions: usize,
     ) -> SocketAddr {
-        sharded_forwarder(pool, quota, max_sessions, 1).await
+        sharded_forwarder(pool, quota, max_sessions, 1, IDLE_TIMEOUT).await
     }
 
     async fn sharded_forwarder(
@@ -552,6 +564,7 @@ mod tests {
         quota: Arc<UserQuota>,
         max_sessions: usize,
         shards: usize,
+        idle_timeout: Duration,
     ) -> SocketAddr {
         let endpoints = bind_shards("127.0.0.1:0".parse().unwrap(), shards).unwrap();
         let addr = endpoints[0].socket.local_addr().unwrap();
@@ -561,6 +574,7 @@ mod tests {
             quota,
             never_stop(),
             max_sessions,
+            idle_timeout,
         ));
         addr
     }
@@ -605,7 +619,7 @@ mod tests {
     async fn sharded_listener_serves_every_client() {
         let quota = unlimited();
         let pool = TargetPool::new("a".into(), vec![tagged_echo(b"").await], None);
-        let addr = sharded_forwarder(pool, quota.clone(), MAX_SESSIONS, 4).await;
+        let addr = sharded_forwarder(pool, quota.clone(), MAX_SESSIONS, 4, IDLE_TIMEOUT).await;
         let mut clients = Vec::new();
         for _ in 0..16 {
             clients.push(client(addr).await);
@@ -696,6 +710,40 @@ mod tests {
 
         first.send(b"z").await.unwrap();
         assert_eq!(recv(&first).await.as_deref(), Some(&b"z"[..]));
+    }
+
+    #[tokio::test]
+    async fn idle_session_is_reclaimed() {
+        let pool = TargetPool::new("a".into(), vec![tagged_echo(b"").await], None);
+        let addr = sharded_forwarder(pool, unlimited(), 1, 1, Duration::from_millis(200)).await;
+        let first = client(addr).await;
+        first.send(b"x").await.unwrap();
+        assert!(recv(&first).await.is_some());
+
+        let second = client(addr).await;
+        second.send(b"y").await.unwrap();
+        assert!(recv(&second).await.is_none());
+
+        second.send(b"z").await.unwrap();
+        assert_eq!(recv(&second).await.as_deref(), Some(&b"z"[..]));
+    }
+
+    #[tokio::test]
+    async fn client_traffic_keeps_session_open() {
+        let pool = TargetPool::new("a".into(), vec![limited_echo(b"", 1).await], None);
+        let addr = sharded_forwarder(pool, unlimited(), 1, 1, Duration::from_millis(300)).await;
+        let first = client(addr).await;
+        first.send(b"x").await.unwrap();
+        assert!(recv(&first).await.is_some());
+
+        for _ in 0..10 {
+            first.send(b"x").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let second = client(addr).await;
+        second.send(b"y").await.unwrap();
+        assert!(recv(&second).await.is_none());
     }
 
     #[tokio::test]

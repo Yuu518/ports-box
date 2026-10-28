@@ -150,30 +150,54 @@ async fn handle(
     }
 }
 
+#[derive(Default)]
+struct Lease {
+    pipe: Option<Pipe>,
+    buffered: usize,
+}
+
+impl Lease {
+    fn give_back(&mut self) {
+        if let Some(pipe) = self.pipe.take()
+            && self.buffered == 0
+        {
+            pipe.release();
+        }
+        self.buffered = 0;
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        self.give_back();
+    }
+}
+
 async fn copy_counted(
     mut reader: OwnedReadHalf,
     mut writer: OwnedWriteHalf,
     quota: &UserQuota,
     direction: Direction,
 ) -> io::Result<()> {
-    let mut pipe: Option<Pipe> = None;
+    let mut lease = Lease::default();
     let mut can_splice = true;
     let mut buf = Vec::new();
     loop {
         reader.as_ref().readable().await?;
-        if pipe.is_none() && can_splice {
-            pipe = Pipe::acquire();
-            can_splice = pipe.is_some();
+        if lease.pipe.is_none() && can_splice {
+            lease.pipe = Pipe::acquire();
+            can_splice = lease.pipe.is_some();
         }
-        let n = match &pipe {
+        let n = match &mut lease.pipe {
             Some(p) => {
                 let src = reader.as_ref();
                 match src.try_io(Interest::READABLE, || p.fill_from(src)) {
-                    Ok(n) => n,
+                    Ok(n) => {
+                        lease.buffered = n;
+                        n
+                    }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        if let Some(p) = pipe.take() {
-                            p.release();
-                        }
+                        lease.give_back();
                         continue;
                     }
                     Err(e) => return Err(e),
@@ -194,18 +218,18 @@ async fn copy_counted(
         if !quota.try_consume(n as u64, direction) {
             return Err(io::Error::other("quota exhausted"));
         }
-        match &pipe {
+        match &lease.pipe {
             Some(p) => {
                 let dst = writer.as_ref();
-                let mut left = n;
-                while left > 0 {
+                while lease.buffered > 0 {
+                    let left = lease.buffered;
                     let sent = dst
                         .async_io(Interest::WRITABLE, || p.drain_to(dst, left))
                         .await?;
                     if sent == 0 {
                         return Err(io::ErrorKind::WriteZero.into());
                     }
-                    left -= sent;
+                    lease.buffered -= sent;
                 }
             }
             None => writer.write_all(&buf[..n]).await?,
@@ -374,6 +398,23 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lease_returns_only_empty_pipes() {
+        assert_eq!(Pipe::idle_count(), 0);
+        drop(Lease {
+            pipe: Pipe::acquire(),
+            buffered: 0,
+        });
+        assert_eq!(Pipe::idle_count(), 1);
+
+        drop(Lease {
+            pipe: Pipe::acquire(),
+            buffered: 5,
+        });
+        assert_eq!(Pipe::idle_count(), 0);
     }
 
     #[tokio::test]
