@@ -1,5 +1,5 @@
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicI64, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, Ordering};
 
 use tokio::sync::watch;
 
@@ -89,6 +89,7 @@ pub struct UserQuota {
     metering: AtomicU8,
     /// Serializes rollover and snapshotting; never held across an await.
     settle_lock: Mutex<()>,
+    exhausted_flag: AtomicBool,
     exhausted: watch::Sender<bool>,
 }
 
@@ -143,7 +144,8 @@ impl UserQuota {
             )
         };
         let used = settled + metering.bill(hour_up, hour_down);
-        let (exhausted, _) = watch::channel(limit.is_some_and(|l| used >= l));
+        let exhausted_now = limit.is_some_and(|l| used >= l);
+        let (exhausted, _) = watch::channel(exhausted_now);
         Self {
             name,
             limit: AtomicU64::new(limit.unwrap_or(NO_LIMIT)),
@@ -155,6 +157,7 @@ impl UserQuota {
             bucket_hour: AtomicI64::new(now_hour),
             metering: AtomicU8::new(metering_code(metering)),
             settle_lock: Mutex::new(()),
+            exhausted_flag: AtomicBool::new(exhausted_now),
             exhausted,
         }
     }
@@ -181,6 +184,7 @@ impl UserQuota {
         if let Some(limit) = self.limit()
             && self.used() >= limit
         {
+            self.exhausted_flag.store(true, Ordering::Relaxed);
             self.exhausted.send_replace(true);
             return false;
         }
@@ -233,6 +237,7 @@ impl UserQuota {
         self.limit
             .store(limit.unwrap_or(NO_LIMIT), Ordering::Relaxed);
         let exhausted = limit.is_some_and(|l| self.used() >= l);
+        self.exhausted_flag.store(exhausted, Ordering::Relaxed);
         self.exhausted.send_if_modified(|current| {
             let changed = *current != exhausted;
             *current = exhausted;
@@ -241,7 +246,7 @@ impl UserQuota {
     }
 
     pub fn is_exhausted(&self) -> bool {
-        *self.exhausted.borrow()
+        self.exhausted_flag.load(Ordering::Relaxed)
     }
 
     pub fn subscribe(&self) -> watch::Receiver<bool> {
